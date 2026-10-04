@@ -1,648 +1,493 @@
 #!/usr/bin/env python3
-"""
-register - simple named register manager
-
-Implements:
-  register add
-  register update
-  register remove
-  register show
-  register run
-  register copy
-"""
+"""Persistent named byte buffers with Unix input, output, and execution."""
 
 import argparse
-import json
-import os
-import re
-import stat
-import sys
-import subprocess
-from pathlib import Path
 import errno
 import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+
+from register_support import detect_content, read_clipboard, write_clipboard
 
 
-REGISTER_DIR = Path.home() / ".register"
-METADATA_PATH = REGISTER_DIR / "register_metadata.json"
-LOCK_PATH = REGISTER_DIR / "metadata.lock"
+STORE_DIR = Path(os.environ.get("REGISTER_HOME", str(Path.home() / ".register"))).expanduser()
+DATABASE = STORE_DIR / "register.sqlite3"
+APPLICATION_ID = 0x52454752
+NAME_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._-]*\Z")
+RESERVED_NAMES = {"CLIPBOARD", "PRIMARY"}
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS registers (
+    name TEXT PRIMARY KEY,
+    content BLOB NOT NULL,
+    executable INTEGER NOT NULL CHECK (executable IN (0, 1)),
+    utf8 INTEGER NOT NULL CHECK (utf8 IN (0, 1)),
+    mime TEXT NOT NULL
+)
+"""
 
-# exclude leading '-' so argparse is never confused
-NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")
 
 class RegisterError(Exception):
     pass
 
 
-def ensure_register_dir():
-    """Ensure ~/.register exists with mode 0700."""
-    try:
-        REGISTER_DIR.mkdir(mode=0o700, exist_ok=True)
-    except OSError as e:
-        raise RegisterError("failed to create register directory: %s" % e)
+def validate_name(name):
+    if name in RESERVED_NAMES:
+        raise RegisterError("name '%s' is reserved for a clipboard selection" % name)
+    if name in {".", ".."} or not NAME_RE.fullmatch(name):
+        raise RegisterError(
+            "invalid name '%s' (use letters, numbers, '.', '_', and '-'; no leading '-')" % name
+        )
 
 
-def acquire_lock():
-    """Acquire an exclusive lock on the metadata lock file."""
-    ensure_register_dir()
+def validate_mime(value):
+    value = value.strip()
+    if "/" not in value or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value):
+        raise argparse.ArgumentTypeError("MIME must be a media type such as text/plain")
+    return value
+
+
+def is_our_database():
+    if not DATABASE.exists():
+        return False
+    if DATABASE.is_symlink() or not DATABASE.is_file():
+        raise RegisterError("store path must be a regular file, not a symlink: %s" % DATABASE)
+    connection = None
     try:
-        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError as e:
-        raise RegisterError("failed to open lock file: %s" % e)
+        connection = sqlite3.connect(DATABASE.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        identity = connection.execute("PRAGMA application_id").fetchone()[0]
+        if identity != APPLICATION_ID:
+            return False
+        connection.execute("SELECT name, content, executable, utf8, mime FROM registers LIMIT 0")
+        return True
+    except sqlite3.OperationalError as error:
+        if "locked" in str(error) or "busy" in str(error):
+            raise
+        return False
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def create_schema(connection):
+    connection.execute(SCHEMA)
+    connection.execute("PRAGMA application_id = %d" % APPLICATION_ID)
+
+
+def initialize_store():
+    """Publish a complete empty database without overwriting a concurrent creator."""
+    fd, filename = tempfile.mkstemp(prefix=".register-create-", dir=STORE_DIR)
+    os.close(fd)
+    staging = Path(filename)
+    try:
+        connection = sqlite3.connect(staging)
+        try:
+            with connection:
+                create_schema(connection)
+        finally:
+            connection.close()
+        with staging.open("rb") as durable:
+            os.fsync(durable.fileno())
+        try:
+            os.link(staging, DATABASE)
+        except FileExistsError:
+            pass
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def migrate_legacy():
+    """Publish an entire old store before removing any imported source files."""
+    metadata = STORE_DIR / "register_metadata.json"
+    if metadata.is_symlink():
+        raise RegisterError("legacy metadata must not be a symlink: %s" % metadata)
+    if not metadata.exists():
+        return
+    lock = STORE_DIR / "metadata.lock"
+    if lock.is_symlink():
+        raise RegisterError("legacy lock is a symlink; resolve it before migrating: %s" % lock)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    staging = None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-    except OSError as e:
-        os.close(fd)
-        raise RegisterError("failed to acquire metadata lock: %s" % e)
-    return fd
-
-
-def release_lock(fd):
-    """Release the exclusive lock."""
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if is_our_database() or not metadata.exists():
+            return
+        metadata_details = metadata.lstat()
+        if not stat.S_ISREG(metadata_details.st_mode):
+            raise RegisterError("legacy metadata must be a regular file: %s" % metadata)
+        try:
+            old = json.loads(metadata.read_text(encoding="utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise RegisterError("cannot migrate legacy metadata: %s" % error) from error
+        if not isinstance(old, dict):
+            raise RegisterError("legacy metadata must be a JSON object")
+        if DATABASE.exists() and DATABASE.name not in old:
+            raise RegisterError("unrecognized existing %s; move it aside before migrating" % DATABASE)
+        records = []
+        imported_files = []
+        for name, properties in old.items():
+            try:
+                validate_name(name)
+                if name in {"register_metadata.json", "register_metadata.json.tmp", "metadata.lock"}:
+                    raise RegisterError("name conflicts with legacy bookkeeping")
+            except RegisterError as error:
+                raise RegisterError(
+                    "cannot migrate legacy name '%s': %s; rename it in the old store first" % (name, error)
+                ) from error
+            if (not isinstance(properties, dict)
+                    or type(properties.get("exec")) is not bool
+                    or type(properties.get("utf8")) is not bool):
+                raise RegisterError("legacy register '%s' needs boolean exec and utf8 properties" % name)
+            path = STORE_DIR / name
+            details = path.lstat()
+            if not stat.S_ISREG(details.st_mode):
+                raise RegisterError("legacy register '%s' must be a regular file, not a symlink" % name)
+            content = path.read_bytes()
+            _, mime = detect_content(content)
+            records.append((name, content, int(properties["exec"]), int(properties["utf8"]), mime))
+            imported_files.append((path, details))
+        stage_fd, stage_name = tempfile.mkstemp(prefix=".register-migrate-", dir=STORE_DIR)
+        staging = Path(stage_name)
+        os.close(stage_fd)
+        connection = sqlite3.connect(staging)
+        try:
+            with connection:
+                create_schema(connection)
+                connection.executemany("INSERT INTO registers VALUES (?, ?, ?, ?, ?)", records)
+        finally:
+            connection.close()
+        with staging.open("rb") as durable:
+            os.fsync(durable.fileno())
+        os.replace(staging, DATABASE)
+        staging = None
+        directory_fd = os.open(STORE_DIR, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        for path, before in [*imported_files, (metadata, metadata_details)]:
+            if path == DATABASE:
+                continue
+            try:
+                after = path.lstat()
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                    print("register: imported successfully; retained a changed old file: %s" % path, file=sys.stderr)
+                    continue
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                print("register: imported successfully; could not remove old file %s: %s" % (path, error), file=sys.stderr)
     finally:
+        if staging is not None:
+            staging.unlink(missing_ok=True)
+        fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
-def load_metadata_no_lock():
-    """Load metadata as dict, or {} if file does not exist.
-
-    Raises RegisterError on parse errors or wrong top-level type.
-    """
-    if not METADATA_PATH.exists():
-        return {}
-    try:
-        text = METADATA_PATH.read_text(encoding="utf-8")
-    except OSError as e:
-        raise RegisterError("failed to read metadata: %s" % e)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RegisterError("failed to parse metadata JSON: %s" % e)
-    if not isinstance(data, dict):
-        raise RegisterError("metadata JSON must be an object at top level")
-    return data
+def prepare_store():
+    STORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if STORE_DIR.is_symlink() or not STORE_DIR.is_dir():
+        raise RegisterError("register directory must be a real directory: %s" % STORE_DIR)
+    STORE_DIR.chmod(0o700)
+    if DATABASE.is_symlink():
+        raise RegisterError("store path must not be a symlink: %s" % DATABASE)
+    if is_our_database():
+        DATABASE.chmod(0o600)
+        return
+    migrate_legacy()
+    if not DATABASE.exists():
+        initialize_store()
+    if not is_our_database():
+        raise RegisterError("unrecognized existing store %s; move it aside before continuing" % DATABASE)
+    DATABASE.chmod(0o600)
 
 
-def write_metadata_atomic(meta):
-    """Write metadata dict atomically with a temp file + replace."""
-    tmp_path = METADATA_PATH.with_suffix(".json.tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.replace(str(tmp_path), str(METADATA_PATH))
-    except OSError as e:
-        # Best-effort cleanup of temp file
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
-        raise RegisterError("failed to write metadata: %s" % e)
-
-
-def require_register(meta, name):
-    """Return (path, entry) for an existing, non-corrupt register.
-
-    Raises RegisterError if the name is unknown or the backing file is missing.
-    """
-    if name not in meta:
-        raise RegisterError("name '%s' not found" % name)
-    path = REGISTER_DIR / name
-    if not path.exists():
-        raise RegisterError( "register '%s' is corrupt (metadata exists, file missing)" % name )
-    entry = meta[name]
-    return path, entry
-
-
-def validate_name(name):
-    if not NAME_RE.fullmatch(name):
-        raise RegisterError( "invalid name '%s' (allowed: A-Z a-z 0-9 . _ -)" % name )
-
-
-def read_file_bytes(path):
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except OSError as e:
-        raise RegisterError( "failed to read source file '%s': %s" % (path, e) )
-
-
-def read_xclip(selection):
-    # selection is "clipboard" or "primary"
-    try:
-        result = subprocess.run(
-            ["xclip", "-selection", selection, "-out"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        raise RegisterError(
-            "xclip is required for --source %s but was not found in PATH" % selection.upper()
-        )
-    if result.returncode != 0:
-        raise RegisterError(
-            "failed to read %s: %s" % (selection, result.stderr.decode("ascii", "replace"))
-        )
-    data = result.stdout
-    if not data:
-        raise RegisterError("%s is empty" % selection.upper())
-    return data
-
-
-def resolve_source_for_add(source_opt):
-    """Return bytes for add().
-
-    Logic:
-      - If source_opt is not None:
-          'CLIPBOARD' or 'PRIMARY' -> xclip
-          else -> file path
-      - Else:
-          if stdin not TTY -> read stdin bytes
-          else -> empty bytes
-    """
-    if source_opt is not None:
-        if source_opt == "CLIPBOARD":
-            return read_xclip("clipboard")
-        if source_opt == "PRIMARY":
-            return read_xclip("primary")
-        # Treat as file path
-        return read_file_bytes(source_opt)
-
-    # No explicit source; check stdin
-    if not sys.stdin.isatty():
-        try:
-            return sys.stdin.buffer.read()
-        except Exception as e:
-            raise RegisterError("failed to read stdin: %s" % e)
-    # TTY stdin -> empty file
-    return b""
-
-
-def resolve_source_for_update(source_opt):
-    """Return bytes for update(), or None if no content change.
-
-    Logic:
-      - If source_opt is not None:
-          'CLIPBOARD' or 'PRIMARY' -> xclip
-          else -> file path
-      - Else:
-          if stdin not TTY -> read stdin bytes
-          else -> None (no content change)
-    """
-    if source_opt is not None:
-        if source_opt == "CLIPBOARD":
-            return read_xclip("clipboard")
-        if source_opt == "PRIMARY":
-            return read_xclip("primary")
-        return read_file_bytes(source_opt)
-
-    if not sys.stdin.isatty():
-        try:
-            return sys.stdin.buffer.read()
-        except Exception as e:
-            raise RegisterError("failed to read stdin: %s" % e)
-    return None
-
-
-def set_exec_flag(path, exec_value):
-    """Apply exec_value to file at path.
-
-    exec_value True  -> chmod u+x
-    exec_value False -> clear all execute bits
-    """
-    try:
-        st = os.stat(path)
-    except OSError as e:
-        raise RegisterError("failed to stat '%s': %s" % (path, e))
-    mode = st.st_mode
-    if exec_value:
-        new_mode = mode | stat.S_IXUSR
+def connect(read_only=False):
+    """Open the store; callers always close before external I/O."""
+    if read_only:
+        connection = sqlite3.connect(DATABASE.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     else:
-        new_mode = mode & ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    if new_mode != mode:
-        try:
-            os.chmod(path, new_mode)
-        except OSError as e:
-            raise RegisterError("failed to chmod '%s': %s" % (path, e))
+        prepare_store()
+        connection = sqlite3.connect(DATABASE, timeout=5)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def fetch_register(connection, name):
+    row = connection.execute("SELECT * FROM registers WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        raise RegisterError("name '%s' not found" % name)
+    return row
+
+
+def read_source(source, keep_content=False, update=False):
+    """Return (bytes, supplied MIME) or None for a properties-only update."""
+    if keep_content:
+        return None
+    if source in RESERVED_NAMES:
+        return read_clipboard(source.lower())
+    if source == "-":
+        return sys.stdin.buffer.read(), None
+    if source is not None:
+        return Path(source).expanduser().read_bytes(), None
+    if not sys.stdin.isatty():
+        return sys.stdin.buffer.read(), None
+    return None if update else (b"", None)
+
+
+def describe_source(source):
+    content, supplied_mime = source
+    utf8, detected_mime = detect_content(content)
+    return content, bool(utf8), supplied_mime or detected_mime
 
 
 def cmd_add(args):
-    name = args.name
-    validate_name(name)
-
-    # Determine content and flags
-    content = resolve_source_for_add(args.source)
-    exec_value = args.exec_flag if args.exec_flag is not None else False
-    utf8_value = args.utf8_flag if args.utf8_flag is not None else True
-
-    lock_fd = acquire_lock()
-    path = REGISTER_DIR / name
-
+    validate_name(args.name)
+    content, utf8, mime = describe_source(read_source(args.source))
+    executable = False if args.exec_flag is None else args.exec_flag
+    utf8 = utf8 if args.utf8_flag is None else args.utf8_flag
+    mime = args.mime or mime
+    connection = connect()
     try:
-        meta = load_metadata_no_lock()
-        if name in meta:
-            raise RegisterError("name '%s' already exists" % name)
-
-        # Create and write file
-        try:
-            with path.open("wb") as f:
-                f.write(content)
-        except OSError as e:
-            # Best-effort cleanup of any partially created file
+        with connection:
+            if connection.execute("SELECT 1 FROM registers WHERE name = ?", (args.name,)).fetchone():
+                raise RegisterError("name '%s' already exists" % args.name)
             try:
-                if path.exists():
-                    path.unlink()
-            except OSError:
-                pass
-            raise RegisterError("failed to write backing file '%s': %s" % (path, e))
-
-        # Apply exec bits, update metadata, and write metadata.
-        # If any of these fail, remove the file so we don't leave a file without metadata.
-        try:
-            set_exec_flag(path, exec_value)
-            meta[name] = {"exec": exec_value, "utf8": utf8_value}
-            write_metadata_atomic(meta)
-        except RegisterError as e:
-            # Roll back file to avoid dangling file without metadata
-            try:
-                if path.exists():
-                    path.unlink()
-            except OSError:
-                pass
-            raise e
+                connection.execute(
+                    "INSERT INTO registers VALUES (?, ?, ?, ?, ?)",
+                    (args.name, content, int(executable), int(utf8), mime),
+                )
+            except sqlite3.IntegrityError as error:
+                raise RegisterError("name '%s' already exists" % args.name) from error
     finally:
-        release_lock(lock_fd)
+        connection.close()
 
 
 def cmd_update(args):
-    name = args.name
-    validate_name(name)
-
-    content = resolve_source_for_update(args.source)
-    exec_flag = args.exec_flag   # None = no change
-    utf8_flag = args.utf8_flag   # None = no change
-
-    lock_fd = acquire_lock()
+    validate_name(args.name)
+    source = read_source(args.source, keep_content=args.keep_content, update=True)
+    replacement = describe_source(source) if source is not None else None
+    connection = connect()
     try:
-        meta = load_metadata_no_lock()
-        path, entry = require_register(meta, name)
-
-        # Update file contents if requested
-        if content is not None:
-            try:
-                with path.open("wb") as f:
-                    f.write(content)
-            except OSError as e:
-                raise RegisterError("failed to write backing file '%s': %s" % (path, e))
-
-        # Update flags in metadata
-        old_exec = bool(entry.get("exec", False))
-        old_utf8 = bool(entry.get("utf8", True))
-
-        new_exec = old_exec
-        if exec_flag is not None:
-            new_exec = exec_flag
-
-        new_utf8 = old_utf8
-        if utf8_flag is not None:
-            new_utf8 = utf8_flag
-
-        entry["exec"] = new_exec
-        entry["utf8"] = new_utf8
-
-        # Apply exec changes to file if changed
-        if new_exec != old_exec:
-            set_exec_flag(path, new_exec)
-
-        # Write metadata back
-        write_metadata_atomic(meta)
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            old = fetch_register(connection, args.name)
+            if replacement is None:
+                content, utf8, mime = old["content"], old["utf8"], old["mime"]
+            else:
+                content, utf8, mime = replacement
+            executable = old["executable"] if args.exec_flag is None else args.exec_flag
+            utf8 = utf8 if args.utf8_flag is None else args.utf8_flag
+            mime = args.mime or mime
+            connection.execute(
+                "UPDATE registers SET content = ?, executable = ?, utf8 = ?, mime = ? WHERE name = ?",
+                (content, int(executable), int(utf8), mime, args.name),
+            )
     finally:
-        release_lock(lock_fd)
+        connection.close()
 
 
 def cmd_copy(args):
-    src = args.source
-    tgt = args.target
-    validate_name(src)
-    validate_name(tgt)
-
-    exec_flag = args.exec_flag   # None = inherit from source
-    utf8_flag = args.utf8_flag   # None = inherit from source
-
-    lock_fd = acquire_lock()
+    validate_name(args.source)
+    validate_name(args.target)
+    connection = connect()
     try:
-        meta = load_metadata_no_lock()
-
-        # Source must exist and be consistent
-        src_path, src_entry = require_register(meta, src)
-        src_exec = bool(src_entry.get("exec", False))
-        src_utf8 = bool(src_entry.get("utf8", True))
-
-        # Target flags: inherit from source, override if flags were given.
-        tgt_exec = src_exec if exec_flag is None else exec_flag
-        tgt_utf8 = src_utf8 if utf8_flag is None else utf8_flag
-
-        # Read source content
-        try:
-            with src_path.open("rb") as f:
-                content = f.read()
-        except OSError as e:
-            raise RegisterError( "failed to read backing file '%s': %s" % (src_path, e) )
-
-        if tgt in meta:
-            # Overwrite existing register (like cp src tgt).
-            tgt_path, tgt_entry = require_register(meta, tgt)
-
-            # Write new contents
-            try:
-                with tgt_path.open("wb") as f:
-                    f.write(content)
-            except OSError as e:
-                raise RegisterError( "failed to write backing file '%s': %s" % (tgt_path, e) )
-
-            # Update flags in metadata
-            old_exec = bool(tgt_entry.get("exec", False))
-
-            tgt_entry["exec"] = tgt_exec
-            tgt_entry["utf8"] = tgt_utf8
-
-            # Apply exec changes to file if changed
-            if tgt_exec != old_exec:
-                set_exec_flag(tgt_path, tgt_exec)
-
-            # Write metadata back
-            write_metadata_atomic(meta)
-        else:
-            # Create a new register tgt with copied content.
-            tgt_path = REGISTER_DIR / tgt
-            try:
-                with tgt_path.open("wb") as f:
-                    f.write(content)
-            except OSError as e:
-                # Best-effort cleanup of any partially created file
-                try:
-                    if tgt_path.exists():
-                        tgt_path.unlink()
-                except OSError:
-                    pass
-                raise RegisterError( "failed to write backing file '%s': %s" % (tgt_path, e) )
-
-            # Apply exec bits, update metadata, and write metadata.
-            try:
-                set_exec_flag(tgt_path, tgt_exec)
-                meta[tgt] = {"exec": tgt_exec, "utf8": tgt_utf8}
-                write_metadata_atomic(meta)
-            except RegisterError as e:
-                # Roll back file to avoid dangling file without metadata
-                try:
-                    if tgt_path.exists():
-                        tgt_path.unlink()
-                except OSError:
-                    pass
-                raise e
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = fetch_register(connection, args.source)
+            executable = source["executable"] if args.exec_flag is None else args.exec_flag
+            utf8 = source["utf8"] if args.utf8_flag is None else args.utf8_flag
+            mime = args.mime or source["mime"]
+            connection.execute(
+                """INSERT INTO registers VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET content = excluded.content,
+                    executable = excluded.executable, utf8 = excluded.utf8, mime = excluded.mime""",
+                (args.target, source["content"], int(executable), int(utf8), mime),
+            )
     finally:
-        release_lock(lock_fd)
+        connection.close()
 
 
 def cmd_remove(args):
-    name = args.name
-    validate_name(name)
-
-    lock_fd = acquire_lock()
+    validate_name(args.name)
+    connection = connect()
     try:
-        meta = load_metadata_no_lock()
-        path, _ = require_register(meta, name)
-
-        # Delete backing file first
-        try:
-            path.unlink()
-
-        except OSError as e:
-            raise RegisterError( "failed to remove backing file for '%s': %s" % (name, e) )
-
-        # Remove from metadata and write back
-        del meta[name]
-        write_metadata_atomic(meta)
+        with connection:
+            deleted = connection.execute("DELETE FROM registers WHERE name = ?", (args.name,))
+            if deleted.rowcount == 0:
+                raise RegisterError("name '%s' not found" % args.name)
     finally:
-        release_lock(lock_fd)
+        connection.close()
 
 
-def cmd_run(args):
-    name = args.name
+def snapshot(name):
     validate_name(name)
-#b
-    # Read-only: no lock needed; metadata writes are atomic.
-    meta = load_metadata_no_lock()
-    path, entry = require_register(meta, name)
-    exec_flag = bool(entry.get("exec", False))
-    if not exec_flag:
-        raise RegisterError( "register '%s' is not marked executable (--exec was not set)" % name )
-
-    # Everything after register_name goes to the executable argument
-    cmd_args = list(args.args or [])
-
+    connection = connect()
     try:
-        # Inherit stdin/stdout/stderr; don't raise on non-zero exit.
-        proc = subprocess.run([str(path)] + cmd_args, check=False)
-    except OSError as e:
-        # If the file is not a native binary or script with shebang,
-        # the kernel returns ENOEXEC. Shells handle this by re-running
-        # the file via /bin/sh; we emulate that behavior.
-        if e.errno == errno.ENOEXEC:
-            shell = os.environ.get("SHELL", "/bin/sh")
-            try:
-                proc = subprocess.run([shell, str(path)] + cmd_args, check=False)
-            except OSError as e2:
-                raise RegisterError( "failed to exec register '%s' via shell: %s" % (name, e2) )
-        else:
-            raise RegisterError( "failed to exec register '%s': %s" % (name, e) )
+        return dict(fetch_register(connection, name))
+    finally:
+        connection.close()
 
-    # Propagate the child exit code as our exit code.
-    sys.exit(proc.returncode)
+
+def cmd_get(args):
+    row = snapshot(args.name)
+    if args.to:
+        write_clipboard(args.to.lower(), row["content"], row["mime"])
+    else:
+        sys.stdout.buffer.write(row["content"])
 
 
 def cmd_show(args):
-    # Read-only; no lock needed because writes are atomic.
-    meta = load_metadata_no_lock()
-
-    # If names are provided, show only those.
-    if args.names:
-        items = []
-        for name in args.names:
-            validate_name(name)
-            path, entry = require_register(meta, name)
-            items.append(
-                {
-                    "name": name,
-                    "path": str(path),
-                    "exec": bool(entry.get("exec", False)),
-                    "utf8": bool(entry.get("utf8", True)),
-                }
-            )
-        # single name -> single object, many names -> list.
-        if len(items) == 1:
-            print(json.dumps(items[0], indent=2))
+    for name in args.names:
+        validate_name(name)
+    connection = connect()
+    try:
+        connection.execute("BEGIN")
+        columns = "name, executable, utf8, mime, length(content) AS size"
+        if args.names:
+            rows = []
+            for name in args.names:
+                row = connection.execute(
+                    "SELECT " + columns + " FROM registers WHERE name = ?", (name,)
+                ).fetchone()
+                if row is None:
+                    raise RegisterError("name '%s' not found" % name)
+                rows.append(row)
         else:
-            print(json.dumps(items, indent=2))
-        return
+            rows = connection.execute("SELECT " + columns + " FROM registers ORDER BY name").fetchall()
+        items = [
+            {"name": row["name"], "exec": bool(row["executable"]),
+             "utf8": bool(row["utf8"]), "mime": row["mime"], "size": row["size"]}
+            for row in rows
+        ]
+    finally:
+        connection.close()
+    print(json.dumps(items[0] if len(args.names) == 1 else items, indent=2))
 
-    # No names provided: show all registers.
-    items = []
-    for name in sorted(meta.keys()):
-        path, entry = require_register(meta, name)
-        items.append(
-            {
-                "name": name,
-                "path": str(path),
-                "exec": bool(entry.get("exec", False)),
-                "utf8": bool(entry.get("utf8", True)),
-            }
-        )
 
-    print(json.dumps(items, indent=2))
+def cmd_run(args):
+    row = snapshot(args.name)
+    if not row["executable"]:
+        raise RegisterError("register '%s' is not marked executable (use --exec)" % args.name)
+    with tempfile.TemporaryDirectory(prefix="register-") as directory:
+        path = Path(directory) / "register"
+        path.write_bytes(row["content"])
+        path.chmod(0o700)
+        command = [str(path), *args.args]
+        try:
+            result = subprocess.run(command, check=False)
+        except OSError as error:
+            if error.errno != errno.ENOEXEC:
+                raise
+            result = subprocess.run(["/bin/bash", *command], check=False)
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+def complete(argv):
+    """Private shell helper: no store creation and no diagnostic chatter."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--exec", action="store_true", dest="executable")
+    parser.add_argument("prefix", nargs="?", default="")
+    args = parser.parse_args(argv)
+    if DATABASE.is_symlink() or not DATABASE.is_file():
+        return 0
+    connection = None
+    names = []
+    try:
+        connection = connect(read_only=True)
+        query = "SELECT name FROM registers"
+        if args.executable:
+            query += " WHERE executable = 1"
+        names = [row["name"] for row in connection.execute(query + " ORDER BY name")
+                 if row["name"].startswith(args.prefix)]
+    except (OSError, sqlite3.Error):
+        return 0
+    finally:
+        if connection is not None:
+            connection.close()
+    for name in names:
+        print(name)
+    return 0
+
+
+def add_property_flags(parser):
+    executable = parser.add_mutually_exclusive_group()
+    executable.add_argument("--exec", action="store_const", const=True, dest="exec_flag", help="allow running")
+    executable.add_argument("--no-exec", action="store_const", const=False, dest="exec_flag", help="disable running")
+    text = parser.add_mutually_exclusive_group()
+    text.add_argument("--utf8", action="store_const", const=True, dest="utf8_flag", help="label as UTF-8 text")
+    text.add_argument("--binary", action="store_const", const=False, dest="utf8_flag", help="label as binary")
+    parser.add_argument("--mime", type=validate_mime, metavar="TYPE", help="override the content MIME type")
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(
-        prog="register",
-        description="Manage named registers stored under ~/.register",
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # add
-    p_add = subparsers.add_parser(
-        "add",
-        help="add a new register",
-        usage="register add name [--source SOURCE] [--exec | --no-exec] [--utf8 | --binary]",
-    )
-    p_add.add_argument("name", help="register name")
-    p_add.add_argument(
-        "--source",
-        help="source: FILE path, or CLIPBOARD, or PRIMARY",
-    )
-    exec_group_add = p_add.add_mutually_exclusive_group()
-    exec_group_add.add_argument(
-        "--exec", dest="exec_flag", action="store_const", const=True,
-        help="mark register as executable"
-    )
-    exec_group_add.add_argument(
-        "--no-exec", dest="exec_flag", action="store_const", const=False,
-        help="mark register as non-executable"
-    )
-    utf8_group_add = p_add.add_mutually_exclusive_group()
-    utf8_group_add.add_argument(
-        "--utf8", dest="utf8_flag", action="store_const", const=True,
-        help="mark register as UTF-8 text (default)"
-    )
-    utf8_group_add.add_argument(
-        "--binary", dest="utf8_flag", action="store_const", const=False,
-        help="mark register as binary data"
-    )
-    p_add.set_defaults(func=cmd_add)
-
-    # update
-    p_up = subparsers.add_parser(
-        "update",
-        help="update an existing register",
-        usage="register update name [--source SOURCE] [--exec | --no-exec] [--utf8 | --binary]",
-    )
-    p_up.add_argument("name", help="register name")
-    p_up.add_argument(
-        "--source",
-        help="source: FILE path, or CLIPBOARD, or PRIMARY",
-    )
-    exec_group_up = p_up.add_mutually_exclusive_group()
-    exec_group_up.add_argument(
-        "--exec", dest="exec_flag", action="store_const", const=True,
-        help="set exec flag true"
-    )
-    exec_group_up.add_argument(
-        "--no-exec", dest="exec_flag", action="store_const", const=False,
-        help="set exec flag false"
-    )
-    utf8_group_up = p_up.add_mutually_exclusive_group()
-    utf8_group_up.add_argument(
-        "--utf8", dest="utf8_flag", action="store_const", const=True,
-        help="set utf8 flag true"
-    )
-    utf8_group_up.add_argument(
-        "--binary", dest="utf8_flag", action="store_const", const=False,
-        help="set utf8 flag false"
-    )
-    p_up.set_defaults(func=cmd_update)
-
-    # copy
-    p_cp = subparsers.add_parser(
-        "copy",
-        help="copy one register to another",
-        usage="register copy source_name target_name [--exec | --no-exec] [--utf8 | --binary]",
-    )
-    p_cp.add_argument("source", help="source register name")
-    p_cp.add_argument("target", help="target register name")
-    exec_group_cp = p_cp.add_mutually_exclusive_group()
-    exec_group_cp.add_argument(
-        "--exec", dest="exec_flag", action="store_const", const=True,
-        help="set exec flag true on target (default: inherit from source)"
-    )
-    exec_group_cp.add_argument(
-        "--no-exec", dest="exec_flag", action="store_const", const=False,
-        help="set exec flag false on target (default: inherit from source)"
-    )
-    utf8_group_cp = p_cp.add_mutually_exclusive_group()
-    utf8_group_cp.add_argument(
-        "--utf8", dest="utf8_flag", action="store_const", const=True,
-        help="set utf8 flag true on target (default: inherit from source)"
-    )
-    utf8_group_cp.add_argument(
-        "--binary", dest="utf8_flag", action="store_const", const=False,
-        help="set utf8 flag false on target (default: inherit from source)"
-    )
-    p_cp.set_defaults(func=cmd_copy)
-
-    # remove
-    p_rm = subparsers.add_parser("remove", help="remove a register")
-    p_rm.add_argument("name", help="register name")
-    p_rm.set_defaults(func=cmd_remove)
-
-    # show
-    p_show = subparsers.add_parser("show", help="show register metadata")
-    p_show.add_argument(
-        "names",
-        nargs="*",
-        help="optional register names; if omitted, show all registers",
-    )
-    p_show.set_defaults(func=cmd_show)
-
-    # run
-    p_run = subparsers.add_parser("run", help="run an executable register")
-    p_run.add_argument("name", help="register name")
-    p_run.add_argument(
-        "args",
-        nargs=argparse.REMAINDER,
-        help="arguments to pass to the register program",
-    )
-    p_run.set_defaults(func=cmd_run)
-
+    parser = argparse.ArgumentParser(description="Manage persistent named byte buffers.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    add = commands.add_parser("add", help="create a register")
+    add.add_argument("name")
+    add.add_argument("--source", metavar="SOURCE", help="file, CLIPBOARD, PRIMARY, or - for stdin")
+    add_property_flags(add)
+    add.set_defaults(func=cmd_add)
+    update = commands.add_parser("update", help="replace contents or change properties")
+    update.add_argument("name")
+    source = update.add_mutually_exclusive_group()
+    source.add_argument("--source", metavar="SOURCE", help="file, CLIPBOARD, PRIMARY, or - for stdin")
+    source.add_argument("--keep-content", action="store_true", help="change properties without reading stdin")
+    add_property_flags(update)
+    update.set_defaults(func=cmd_update)
+    copy = commands.add_parser("copy", help="copy a register, overwriting the target")
+    copy.add_argument("source")
+    copy.add_argument("target")
+    add_property_flags(copy)
+    copy.set_defaults(func=cmd_copy)
+    remove = commands.add_parser("remove", help="delete a register")
+    remove.add_argument("name")
+    remove.set_defaults(func=cmd_remove)
+    show = commands.add_parser("show", help="show metadata as JSON")
+    show.add_argument("names", nargs="*")
+    show.set_defaults(func=cmd_show)
+    get = commands.add_parser("get", help="write exact bytes to stdout or a clipboard")
+    get.add_argument("name")
+    get.add_argument("--to", choices=["CLIPBOARD", "PRIMARY"], help="write to a clipboard selection")
+    get.set_defaults(func=cmd_get)
+    run = commands.add_parser("run", help="execute a snapshot of a register")
+    run.add_argument("name")
+    run.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed unchanged to the program")
+    run.set_defaults(func=cmd_run)
     return parser
 
 
 def main(argv=None):
-    if argv is None:
-        argv = sys.argv[1:]
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
+    argv = sys.argv[1:] if argv is None else argv
     try:
-        args.func(args)
-    except RegisterError as e:
-        print("register: %s" % e, file=sys.stderr)
-        sys.exit(1)
+        if argv and argv[0] == "_complete":
+            result = complete(argv[1:])
+        else:
+            args = build_parser().parse_args(argv)
+            result = args.func(args)
+        sys.stdout.flush()
+        return result or 0
+    except BrokenPipeError:
+        # Avoid a second exception from Python's final stdout flush.
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        return 141
+    except KeyboardInterrupt:
+        return 130
+    except (RegisterError, OSError, sqlite3.Error, ValueError) as error:
+        print("register: %s" % error, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
-
+    sys.exit(main())

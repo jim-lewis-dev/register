@@ -1,0 +1,142 @@
+## HOW TO ADD A REGISTER
+
+# create a blank register
+register add --name register_name \
+             [--file /path/to/register_file] \
+             [--exec | --no-exec] \
+             [--utf8 | --binary]
+
+# create from given file
+register add --name register_name \
+             [--file /path/to/register_file] \
+             --source given_filename \
+             [--exec | --no-exec] \
+             [--utf8 | --binary]
+
+# from clipboard
+register add --name register_name \
+             [--file /path/to/register_file] \
+             --source CLIPBOARD \
+             [--exec | --no-exec] \
+             [--utf8 | --binary]
+
+# from primary
+register add --name register_name \
+             [--file /path/to/register_file] \
+             --source PRIMARY \
+             [--exec | --no-exec] \
+             [--utf8 | --binary]
+
+NOTE:	if --file is omitted, then register_file will be named register_name (and in practice all register files will be stored in the ~/.register/ directory)
+		error if name already exists
+		error if file points to a file that is already in some other register
+
+
+
+
+## HOW TO REMOVE A REGISTER
+
+register remove --name register_name
+
+NOTE:	this deletes the register entry and the register file
+		error if name not found
+
+
+## HOW TO UPDATE A REGISTER
+
+Do we just want to do register add and overwrite what is there?
+Do we want to do register update and then update (and if not there, create or error out?)  What are our tradeoffs and best practices?
+
+
+## HOW TO RUN A REGISTER (only if exec == true)
+
+register run --name register_name
+
+
+## FORMAT OF THE REGISTER METADATA (~/.register/register_metadata.json)
+
+{
+  "do_thing": {
+    "file": "/register_dir/my_script.py",
+    "exec": true,
+    "utf8": true
+  },
+  "raw_blob": {
+    "file": "/register_dir/raw_blob.bin",
+    "exec": false,
+    "utf8": false
+  }
+}
+
+
+## SUMMARY
+#
+Here’s how I understand the system and the decisions so far:
+
+You’re building a “register” tool:
+a small CLI that associates register names (strings) with register values stored in files.
+
+Each register has:
+
+a name (CLI-level handle),
+
+a backing file path,
+
+an exec flag (is this something runnable?),
+
+a utf8 flag (treat as text vs opaque bytes).
+
+Backing files can come from:
+
+A blank file,
+
+An existing file you copy from,
+
+The X CLIPBOARD or PRIMARY selection via xclip.
+
+Default behavior:
+
+Registers live in ~/.register/ by default if --file not given (~/.register/<name>).
+
+Default flags: exec = false, utf8 = true.
+
+add should error if you try to reuse an existing register name.
+
+Metadata:
+
+Stored in ~/.register/register_metadata.json.
+
+Top-level object mapping register names to { file, exec, utf8 }.
+
+Pending design choices you’re now tightening:
+
+Removal semantics (metadata only vs metadata+file, especially with shared files).
+
+Separate add vs update instead of a single overwriting add, to keep behavior explicit and avoid accidental clobbering.
+
+
+
+
+## TODO
+
+# implement run num number of times
+register run [-n num] name
+
+# implement exec hint (if it won't run as bash script)
+#
+## be able to specify
+#
+#	before attempting to run executable, prepend line #!/usr/bin/env PROGRAM
+#	where program can be bash (implied), python3, whatever
+#	this enables being able to run snippets (which have been marked executable) without worrying about it too much
+# so we need to add an optional field to our metadata "exec_command": "PROGRAM"
+
+# implement copy (new register_name and copy of register_file)
+register copy source_register_name target_register_name
+
+and maybe even
+
+register copy source_register_name target_register_name \
+             [--exec | --no-exec] \
+             [--utf8 | --binary]
+

@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""
+register - simple named register manager
+
+Implements:
+  register add
+  register update
+  register remove
+  register show
+  register run
+  register copy
+"""
+
+import argparse
+import json
+import os
+import re
+import stat
+import sys
+import subprocess
+from pathlib import Path
+import errno
+import fcntl
+
+
+REGISTER_DIR = Path.home() / ".register"
+METADATA_PATH = REGISTER_DIR / "register_metadata.json"
+LOCK_PATH = REGISTER_DIR / "metadata.lock"
+
+# exclude leading '-' so argparse is never confused
+NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")
+
+class RegisterError(Exception):
+    pass
+
+
+def ensure_register_dir():
+    """Ensure ~/.register exists with mode 0700."""
+    try:
+        REGISTER_DIR.mkdir(mode=0o700, exist_ok=True)
+    except OSError as e:
+        raise RegisterError("failed to create register directory: %s" % e)
+
+
+def acquire_lock():
+    """Acquire an exclusive lock on the metadata lock file."""
+    ensure_register_dir()
+    try:
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        raise RegisterError("failed to open lock file: %s" % e)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as e:
+        os.close(fd)
+        raise RegisterError("failed to acquire metadata lock: %s" % e)
+    return fd
+
+
+def release_lock(fd):
+    """Release the exclusive lock."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def load_metadata_no_lock():
+    """Load metadata as dict, or {} if file does not exist.
+
+    Raises RegisterError on parse errors or wrong top-level type.
+    """
+    if not METADATA_PATH.exists():
+        return {}
+    try:
+        text = METADATA_PATH.read_text(encoding="utf-8")
+    except OSError as e:
+        raise RegisterError("failed to read metadata: %s" % e)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RegisterError("failed to parse metadata JSON: %s" % e)
+    if not isinstance(data, dict):
+        raise RegisterError("metadata JSON must be an object at top level")
+    return data
+
+
+def write_metadata_atomic(meta):
+    """Write metadata dict atomically with a temp file + replace."""
+    tmp_path = METADATA_PATH.with_suffix(".json.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(str(tmp_path), str(METADATA_PATH))
+    except OSError as e:
+        # Best-effort cleanup of temp file
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise RegisterError("failed to write metadata: %s" % e)
+
+
+def validate_name(name):
+    if not NAME_RE.fullmatch(name):
+        raise RegisterError(
+            "invalid name '%s' (allowed: A-Z a-z 0-9 . _ -)" % name
+        )
+
+
+def read_file_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as e:
+        raise RegisterError("failed to read source file '%s': %s" % (path, e))
+
+
+def read_xclip(selection):
+    # selection is "clipboard" or "primary"
+    try:
+        result = subprocess.run(
+            ["xclip", "-selection", selection, "-out"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise RegisterError(
+            "xclip is required for --source %s but was not found in PATH" % selection.upper()
+        )
+    if result.returncode != 0:
+        raise RegisterError(
+            "failed to read %s: %s" % (selection, result.stderr.decode("ascii", "replace"))
+        )
+    data = result.stdout
+    if not data:
+        raise RegisterError("%s is empty" % selection.upper())
+    return data
+
+
+def resolve_source_for_add(source_opt):
+    """Return bytes for add().
+
+    Logic:
+      - If source_opt is not None:
+          'CLIPBOARD' or 'PRIMARY' -> xclip
+          else -> file path
+      - Else:
+          if stdin not TTY -> read stdin bytes
+          else -> empty bytes
+    """
+    if source_opt is not None:
+        if source_opt == "CLIPBOARD":
+            return read_xclip("clipboard")
+        if source_opt == "PRIMARY":
+            return read_xclip("primary")
+        # Treat as file path
+        return read_file_bytes(source_opt)
+
+    # No explicit source; check stdin
+    if not sys.stdin.isatty():
+        try:
+            return sys.stdin.buffer.read()
+        except Exception as e:
+            raise RegisterError("failed to read stdin: %s" % e)
+    # TTY stdin -> empty file
+    return b""
+
+
+def resolve_source_for_update(source_opt):
+    """Return bytes for update(), or None if no content change.
+
+    Logic:
+      - If source_opt is not None:
+          'CLIPBOARD' or 'PRIMARY' -> xclip
+          else -> file path
+      - Else:
+          if stdin not TTY -> read stdin bytes
+          else -> None (no content change)
+    """
+    if source_opt is not None:
+        if source_opt == "CLIPBOARD":
+            return read_xclip("clipboard")
+        if source_opt == "PRIMARY":
+            return read_xclip("primary")
+        return read_file_bytes(source_opt)
+
+    if not sys.stdin.isatty():
+        try:
+            return sys.stdin.buffer.read()
+        except Exception as e:
+            raise RegisterError("failed to read stdin: %s" % e)
+    return None
+
+
+def set_exec_flag(path, exec_value):
+    """Apply exec_value to file at path.
+
+    exec_value True  -> chmod u+x
+    exec_value False -> clear all execute bits
+    """
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        raise RegisterError("failed to stat '%s': %s" % (path, e))
+    mode = st.st_mode
+    if exec_value:
+        new_mode = mode | stat.S_IXUSR
+    else:
+        new_mode = mode & ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if new_mode != mode:
+        try:
+            os.chmod(path, new_mode)
+        except OSError as e:
+            raise RegisterError("failed to chmod '%s': %s" % (path, e))
+
+
+def cmd_add(args):
+    name = args.name
+    validate_name(name)
+
+    # Determine content and flags
+    content = resolve_source_for_add(args.source)
+    exec_value = args.exec_flag if args.exec_flag is not None else False
+    utf8_value = args.utf8_flag if args.utf8_flag is not None else True
+
+    ensure_register_dir()
+    path = REGISTER_DIR / name
+
+    lock_fd = acquire_lock()
+    try:
+        meta = load_metadata_no_lock()
+        if name in meta:
+            raise RegisterError("name '%s' already exists" % name)
+
+        # Create and write file
+        try:
+            with path.open("wb") as f:
+                f.write(content)
+        except OSError as e:
+            # Best-effort cleanup of any partially created file
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+            raise RegisterError("failed to write backing file '%s': %s" % (path, e))
+
+        # Apply exec bits, update metadata, and write metadata.
+        # If any of these fail, remove the file so we don't leave a file without metadata.
+        try:
+            set_exec_flag(path, exec_value)
+            meta[name] = {"exec": exec_value, "utf8": utf8_value}
+            write_metadata_atomic(meta)
+        except RegisterError as e:
+            # Roll back file to avoid dangling file without metadata
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+            raise e
+    finally:
+        release_lock(lock_fd)
+
+
+def cmd_update(args):
+    name = args.name
+    validate_name(name)
+
+    content = resolve_source_for_update(args.source)
+    exec_flag = args.exec_flag   # None = no change
+    utf8_flag = args.utf8_flag   # None = no change
+
+    ensure_register_dir()
+    path = REGISTER_DIR / name
+
+    lock_fd = acquire_lock()
+    try:
+        meta = load_metadata_no_lock()
+        if name not in meta:
+            raise RegisterError("name '%s' not found" % name)
+
+        if not path.exists():
+            raise RegisterError(
+                "register '%s' is corrupt (metadata exists, file missing)" % name
+            )
+
+        # Update file contents if requested
+        if content is not None:
+            try:
+                with path.open("wb") as f:
+                    f.write(content)
+            except OSError as e:
+                raise RegisterError("failed to write backing file '%s': %s" % (path, e))
+
+        # Update flags in metadata
+        entry = meta[name]
+        old_exec = bool(entry.get("exec", False))
+        old_utf8 = bool(entry.get("utf8", True))
+
+        new_exec = old_exec
+        if exec_flag is not None:
+            new_exec = exec_flag
+
+        new_utf8 = old_utf8
+        if utf8_flag is not None:
+            new_utf8 = utf8_flag
+
+        entry["exec"] = new_exec
+        entry["utf8"] = new_utf8
+
+        # Apply exec changes to file if changed
+        if new_exec != old_exec:
+            set_exec_flag(path, new_exec)
+
+        # Write metadata back
+        write_metadata_atomic(meta)
+    finally:
+        release_lock(lock_fd)
+
+def cmd_copy(args):
+    src = args.source
+    tgt = args.target
+    validate_name(src)
+    validate_name(tgt)
+
+    exec_flag = args.exec_flag   # None = inherit from source
+    utf8_flag = args.utf8_flag   # None = inherit from source
+
+    ensure_register_dir()
+    src_path = REGISTER_DIR / src
+    tgt_path = REGISTER_DIR / tgt
+
+    lock_fd = acquire_lock()
+    try:
+        meta = load_metadata_no_lock()
+
+        # Source must exist and be consistent
+        if src not in meta:
+            raise RegisterError("name '%s' not found" % src)
+        if not src_path.exists():
+            raise RegisterError(
+                "register '%s' is corrupt (metadata exists, file missing)" % src
+            )
+
+        src_entry = meta[src]
+        src_exec = bool(src_entry.get("exec", False))
+        src_utf8 = bool(src_entry.get("utf8", True))
+
+        # Target flags: inherit from source, override if flags were given.
+        tgt_exec = src_exec if exec_flag is None else exec_flag
+        tgt_utf8 = src_utf8 if utf8_flag is None else utf8_flag
+
+        # Read source content
+        try:
+            with src_path.open("rb") as f:
+                content = f.read()
+        except OSError as e:
+            raise RegisterError(
+                "failed to read backing file '%s': %s" % (src_path, e)
+            )
+
+        if tgt in meta:
+            # Overwrite existing register (like cp src tgt).
+            if not tgt_path.exists():
+                raise RegisterError(
+                    "register '%s' is corrupt (metadata exists, file missing)" % tgt
+                )
+
+            # Write new contents
+            try:
+                with tgt_path.open("wb") as f:
+                    f.write(content)
+            except OSError as e:
+                raise RegisterError(
+                    "failed to write backing file '%s': %s" % (tgt_path, e)
+                )
+
+            # Update flags in metadata
+            tgt_entry = meta[tgt]
+            old_exec = bool(tgt_entry.get("exec", False))
+
+            tgt_entry["exec"] = tgt_exec
+            tgt_entry["utf8"] = tgt_utf8
+
+            # Apply exec changes to file if changed
+            if tgt_exec != old_exec:
+                set_exec_flag(tgt_path, tgt_exec)
+
+            # Write metadata back
+            write_metadata_atomic(meta)
+        else:
+            # Create a new register tgt with copied content.
+            try:
+                with tgt_path.open("wb") as f:
+                    f.write(content)
+            except OSError as e:
+                # Best-effort cleanup of any partially created file
+                try:
+                    if tgt_path.exists():
+                        tgt_path.unlink()
+                except OSError:
+                    pass
+                raise RegisterError(
+                    "failed to write backing file '%s': %s" % (tgt_path, e)
+                )
+
+            # Apply exec bits, update metadata, and write metadata.
+            try:
+                set_exec_flag(tgt_path, tgt_exec)
+                meta[tgt] = {"exec": tgt_exec, "utf8": tgt_utf8}
+                write_metadata_atomic(meta)
+            except RegisterError as e:
+                # Roll back file to avoid dangling file without metadata
+                try:
+                    if tgt_path.exists():
+                        tgt_path.unlink()
+                except OSError:
+                    pass
+                raise e
+    finally:
+        release_lock(lock_fd)
+
+def cmd_remove(args):
+    name = args.name
+    validate_name(name)
+
+    ensure_register_dir()
+    path = REGISTER_DIR / name
+
+    lock_fd = acquire_lock()
+    try:
+        meta = load_metadata_no_lock()
+        if name not in meta:
+            raise RegisterError("name '%s' not found" % name)
+
+        if not path.exists():
+            raise RegisterError(
+                "register '%s' is corrupt (metadata exists, file missing)" % name
+            )
+
+        # Delete backing file first
+        try:
+            path.unlink()
+        except OSError as e:
+            raise RegisterError(
+                "failed to remove backing file for '%s': %s" % (name, e)
+            )
+
+        # Remove from metadata and write back
+        del meta[name]
+        write_metadata_atomic(meta)
+    finally:
+        release_lock(lock_fd)
+
+def cmd_run(args):
+    name = args.name
+    validate_name(name)
+
+    # Read-only: no lock needed; metadata writes are atomic.
+    meta = load_metadata_no_lock()
+
+    if name not in meta:
+        raise RegisterError("name '%s' not found" % name)
+
+    path = REGISTER_DIR / name
+    if not path.exists():
+        raise RegisterError(
+            "register '%s' is corrupt (metadata exists, file missing)" % name
+        )
+
+    entry = meta[name]
+    exec_flag = bool(entry.get("exec", False))
+    if not exec_flag:
+        raise RegisterError(
+            "register '%s' is not marked executable (--exec was not set)" % name
+        )
+
+    # Everything after register_name goes to the executable argument
+    cmd_args = list(args.args or [])
+
+    try:
+        # Inherit stdin/stdout/stderr; don't raise on non-zero exit.
+        proc = subprocess.run([str(path)] + cmd_args, check=False)
+    except OSError as e:
+        # If the file is not a native binary or script with shebang,
+        # the kernel returns ENOEXEC. Shells handle this by re-running
+        # the file via /bin/sh; we emulate that behavior.
+        if e.errno == errno.ENOEXEC:
+            shell = os.environ.get("SHELL", "/bin/sh")
+            try:
+                proc = subprocess.run([shell, str(path)] + cmd_args, check=False)
+            except OSError as e2:
+                raise RegisterError(
+                    "failed to exec register '%s' via shell: %s" % (name, e2)
+                )
+        else:
+            raise RegisterError("failed to exec register '%s': %s" % (name, e))
+
+    # Propagate the child exit code as our exit code.
+    sys.exit(proc.returncode)
+
+def cmd_show(args):
+    # Read-only; no lock needed because writes are atomic.
+    meta = load_metadata_no_lock()
+
+    # If names are provided, show only those.
+    if args.names:
+        items = []
+        for name in args.names:
+            validate_name(name)
+            if name not in meta:
+                raise RegisterError("name '%s' not found" % name)
+            path = REGISTER_DIR / name
+            if not path.exists():
+                raise RegisterError(
+                    "register '%s' is corrupt (metadata exists, file missing)" % name
+                )
+            entry = meta[name]
+            items.append(
+                {
+                    "name": name,
+                    "path": str(path),
+                    "exec": bool(entry.get("exec", False)),
+                    "utf8": bool(entry.get("utf8", True)),
+                }
+            )
+        # Preserve old behavior: single name -> single object, many names -> list.
+        if len(items) == 1:
+            print(json.dumps(items[0], indent=2))
+        else:
+            print(json.dumps(items, indent=2))
+        return
+
+    # No names provided: show all registers (old --all behavior).
+    items = []
+    for name in sorted(meta.keys()):
+        path = REGISTER_DIR / name
+        if not path.exists():
+            raise RegisterError(
+                "register '%s' is corrupt (metadata exists, file missing)" % name
+            )
+        entry = meta[name]
+        items.append(
+            {
+                "name": name,
+                "path": str(path),
+                "exec": bool(entry.get("exec", False)),
+                "utf8": bool(entry.get("utf8", True)),
+            }
+        )
+    print(json.dumps(items, indent=2))
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="register",
+        description="Manage named registers stored under ~/.register",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # add
+    p_add = subparsers.add_parser(
+        "add",
+        help="add a new register",
+        usage="register add name [--source SOURCE] [--exec | --no-exec] [--utf8 | --binary]",
+    )
+    p_add.add_argument("name", help="register name")
+    p_add.add_argument(
+        "--source",
+        help="source: FILE path, or CLIPBOARD, or PRIMARY",
+    )
+    exec_group_add = p_add.add_mutually_exclusive_group()
+    exec_group_add.add_argument(
+        "--exec", dest="exec_flag", action="store_const", const=True,
+        help="mark register as executable"
+    )
+    exec_group_add.add_argument(
+        "--no-exec", dest="exec_flag", action="store_const", const=False,
+        help="mark register as non-executable"
+    )
+    utf8_group_add = p_add.add_mutually_exclusive_group()
+    utf8_group_add.add_argument(
+        "--utf8", dest="utf8_flag", action="store_const", const=True,
+        help="mark register as UTF-8 text (default)"
+    )
+    utf8_group_add.add_argument(
+        "--binary", dest="utf8_flag", action="store_const", const=False,
+        help="mark register as binary data"
+    )
+    p_add.set_defaults(func=cmd_add)
+
+    # update
+    p_up = subparsers.add_parser(
+        "update",
+        help="update an existing register",
+        usage="register update name [--source SOURCE] [--exec | --no-exec] [--utf8 | --binary]",
+    )
+    p_up.add_argument("name", help="register name")
+    p_up.add_argument(
+        "--source",
+        help="source: FILE path, or CLIPBOARD, or PRIMARY",
+    )
+    exec_group_up = p_up.add_mutually_exclusive_group()
+    exec_group_up.add_argument(
+        "--exec", dest="exec_flag", action="store_const", const=True,
+        help="set exec flag true"
+    )
+    exec_group_up.add_argument(
+        "--no-exec", dest="exec_flag", action="store_const", const=False,
+        help="set exec flag false"
+    )
+    utf8_group_up = p_up.add_mutually_exclusive_group()
+    utf8_group_up.add_argument(
+        "--utf8", dest="utf8_flag", action="store_const", const=True,
+        help="set utf8 flag true"
+    )
+    utf8_group_up.add_argument(
+        "--binary", dest="utf8_flag", action="store_const", const=False,
+        help="set utf8 flag false"
+    )
+    p_up.set_defaults(func=cmd_update)
+
+    # copy
+    p_cp = subparsers.add_parser(
+        "copy",
+        help="copy one register to another",
+        usage="register copy source_name target_name [--exec | --no-exec] [--utf8 | --binary]",
+    )
+    p_cp.add_argument("source", help="source register name")
+    p_cp.add_argument("target", help="target register name")
+    exec_group_cp = p_cp.add_mutually_exclusive_group()
+    exec_group_cp.add_argument(
+        "--exec", dest="exec_flag", action="store_const", const=True,
+        help="set exec flag true on target (default: inherit from source)"
+    )
+    exec_group_cp.add_argument(
+        "--no-exec", dest="exec_flag", action="store_const", const=False,
+        help="set exec flag false on target (default: inherit from source)"
+    )
+    utf8_group_cp = p_cp.add_mutually_exclusive_group()
+    utf8_group_cp.add_argument(
+        "--utf8", dest="utf8_flag", action="store_const", const=True,
+        help="set utf8 flag true on target (default: inherit from source)"
+    )
+    utf8_group_cp.add_argument(
+        "--binary", dest="utf8_flag", action="store_const", const=False,
+        help="set utf8 flag false on target (default: inherit from source)"
+    )
+    p_cp.set_defaults(func=cmd_copy)
+
+    # remove
+    p_rm = subparsers.add_parser("remove", help="remove a register")
+    p_rm.add_argument("name", help="register name")
+    p_rm.set_defaults(func=cmd_remove)
+
+    # show
+    p_show = subparsers.add_parser("show", help="show register metadata")
+    p_show.add_argument(
+        "names",
+        nargs="*",
+        help="optional register names; if omitted, show all registers",
+    )
+    p_show.set_defaults(func=cmd_show)
+
+    # run
+    p_run = subparsers.add_parser("run", help="run an executable register")
+    p_run.add_argument("name", help="register name")
+    p_run.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="arguments to pass to the register program",
+    )
+    p_run.set_defaults(func=cmd_run)
+
+    return parser
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        args.func(args)
+    except RegisterError as e:
+        print("register: %s" % e, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+

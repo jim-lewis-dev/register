@@ -80,30 +80,75 @@ trap 'rm -f -- "$launcher_tmp" "$completion_tmp"' EXIT
     printf 'exec python3 %q "$@"\n' "$project_dir/register"
 } > "$launcher_tmp"
 chmod 755 "$launcher_tmp"
-cp -- "$project_dir/completion/register.bash" "$completion_tmp"
+{
+    printf '%s\n' "$completion_marker"
+    printf '# Follow the project completion file when a shell loads completion.\n'
+    printf 'if [[ -r %q ]]; then\n' "$project_dir/completion/register.bash"
+    printf '    source %q\n' "$project_dir/completion/register.bash"
+    printf 'fi\n'
+} > "$completion_tmp"
 chmod 644 "$completion_tmp"
 mv -f -- "$launcher_tmp" "$launcher"
 mv -f -- "$completion_tmp" "$completion_file"
 
-# A marked block makes completion work even without the bash-completion package.
-if ! grep -Fqx '# >>> register installer >>>' "$bashrc" 2>/dev/null; then
-    cat >> "$bashrc" <<'BASHRC'
+# Keep shared PATH setup separate from the register-specific completion hook.
+python3 - "$bashrc" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
 
-# >>> register installer >>>
+path = Path(sys.argv[1])
+if path.is_symlink():
+    path = path.resolve(strict=True)
+old = path.read_bytes() if path.exists() else b""
+mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+shared = b'''# >>> user local bin >>>
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *) export PATH="$HOME/.local/bin:$PATH" ;;
 esac
+# <<< user local bin <<<
+'''
+completion = b'''# >>> register installer >>>
 if [[ -r "$HOME/.local/share/bash-completion/completions/register" ]]; then
     source "$HOME/.local/share/bash-completion/completions/register"
 fi
 # <<< register installer <<<
-BASHRC
-    printf 'Added a marked PATH/completion block to %s\n' "$bashrc"
-fi
+'''
+
+def set_block(text, start_marker, end_marker, replacement):
+    start = text.find(start_marker)
+    if start != -1:
+        end = text.find(end_marker, start + len(start_marker))
+        if end == -1:
+            raise SystemExit("Refusing to edit an incomplete managed block in %s" % path)
+        return text[:start] + replacement + text[end + len(end_marker):]
+    separator = b"" if not text else (b"\n" if text.endswith(b"\n") else b"\n\n")
+    return text + separator + replacement
+
+updated = old
+if b"# >>> user local bin >>>\n" not in updated:
+    updated = set_block(updated, b"# >>> user local bin >>>\n", b"# <<< user local bin <<<\n", shared)
+updated = set_block(updated, b"# >>> register installer >>>\n", b"# <<< register installer <<<\n", completion)
+if updated != old:
+    descriptor, temporary = tempfile.mkstemp(prefix=".bashrc-register-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    print("Enabled shared user PATH and register completion in %s" % path)
+PY
 
 printf 'Installed %s\n' "$launcher"
 printf 'Enabled Bash completion in %s\n' "$completion_file"
+printf 'Completion follows %s\n' "$project_dir/completion/register.bash"
 printf '%s\n' 'Open a new Bash terminal, or activate in this shell:'
 printf 'export PATH="$HOME/.local/bin:$PATH"; source %q\n' "$completion_file"
 missing=()

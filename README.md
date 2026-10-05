@@ -7,26 +7,39 @@ Buffers survive new terminals and reboots. Keep a useful input, the command that
 ```bash
 register add greeting 'hello world'
 register get greeting | tr a-z A-Z | register update greeting
-register get greeting CLIPBOARD
 register add greet 'printf "Hello, %s\n" "$1"' --exec
 register run greet world
 register show
 ```
 
-## Optional shell setup
+The pipeline changes `greeting` to `HELLO WORLD`; `register get greeting` retrieves it exactly, without an added newline. Running `greet` prints `Hello, world`.
 
-The program runs directly with `python3 register`. To make `register` available everywhere with Bash Tab completion:
+## Install
+
+Register requires Linux, Python 3.10 or newer, and Bash. It has no Python package dependencies. On Ubuntu or Debian:
 
 ```bash
-cd ~/projects/register
-./install.sh
+sudo apt-get update
+sudo apt-get install -y git
+git clone https://github.com/jim-lewis-dev/register.git
+cd register
+./install.sh --dependencies
 ```
 
-Open a new Bash terminal afterward. Installation creates a launcher in `~/.local/bin`, a completion loader, and marked PATH and completion blocks in `~/.bashrc`. Both launcher and completion follow the project files; ordinary project updates need no reinstall. Rerun installation after moving the project.
+Open a new Bash terminal, then try the introductory examples. The installer makes `register` available everywhere and enables Tab completion. `--dependencies` uses apt to install missing Python, MIME-detection, and clipboard helpers; the program chooses the desktop clipboard backend automatically. If those dependencies are already installed, `./install.sh` performs only the shell setup.
 
-If an earlier installation copied the completion file, run `./install.sh` once and open a new Bash terminal to switch to the project-following loader. Future updates need no reinstall.
+To try clipboard output after setup, create a text buffer and copy it to the desktop clipboard:
 
-Python 3.10 or newer and Bash are required; there are no Python package dependencies. On Ubuntu/Debian, `./install.sh --dependencies` also uses apt to install missing runtime and clipboard helpers. The program chooses the desktop clipboard backend automatically. `./uninstall.sh` removes the register launcher and completion hooks, keeping the shared PATH setup, project, saved registers, and installed packages. Install and uninstall are optional shell conveniences; project updates do not run either one.
+```bash
+register add clipboard-note 'Saved with register'
+register get clipboard-note CLIPBOARD
+```
+
+Paste into a desktop text editor to see the result.
+
+Installation creates a launcher in `~/.local/bin`, a completion loader, and marked PATH and completion blocks in `~/.bashrc`. Both launcher and completion follow the project files. Rerun installation after moving the project. `./uninstall.sh` removes the launcher and completion hooks, keeping the shared PATH setup, project, saved registers, and installed packages.
+
+Shell setup is optional: run `./register --help` or `python3 register --help` from the project folder, and use `./register` wherever the examples say `register`.
 
 ## Commands
 
@@ -86,23 +99,15 @@ Saving never executes content. `run` requires the executable property. A command
 
 See [EXAMPLES.md](EXAMPLES.md) for a JSON-array pick list, Bash filename arrays, reusable replies, binary snapshots, and clipboard workflows. Each example runs in an isolated store.
 
-## Project updates and snapshots
+## Update
 
-Keep `update.py` and `export.py` in this project folder. Commit or remove local changes before updating. Download `register_update.zip` to `~/Downloads`, then run from the project folder:
-
-```bash
-python3 update.py
-```
-
-The updater selects the newest matching download, including browser duplicate names such as `register_update (1).zip`. It requires a clean Git repository, including untracked files. It validates the package and baseline, applies changes, runs tests, commits, then deletes the selected ZIP after success. It runs no installer and makes no shell or package changes. Failures before commit keep the ZIP and restore touched files and the Git index if no other process has committed in the meantime. An explicit path also works: `python3 update.py /path/to/register_update.zip`; archives outside Downloads are kept. Open a new Bash terminal after an update to load any completion changes.
-
-To send your current project for review:
+For an unmodified GitHub clone, run from the project folder:
 
 ```bash
-python3 export.py
+git pull --ff-only
 ```
 
-This creates `register-snapshot.zip` beside the script, including current source, uncommitted work, and Git context. It works without Git and makes no commit. Generated archives, Git history, caches, private credentials, and register databases are excluded.
+Open a new Bash terminal to load any completion changes. Reinstallation is unnecessary.
 
 ## Storage and tests
 
@@ -116,4 +121,10 @@ python3 -m unittest discover -s tests -v
 
 The tests invoke the real CLI in temporary stores and check returned bytes, properties, exit codes, and side effects. They cover file snapshots, pipes and empty input, option placement, command arguments, Bash/native execution, failed writes, concurrent first use, and live completion queries. Separate tests exercise install/uninstall in temporary home folders, export exclusions, and update success or rollback in disposable Git repositories. These checks do not use your saved registers or install packages.
 
-Clipboard tests simulate both desktop backends to verify bytes and MIME handling. They cannot prove that a particular desktop application accepts a paste; the clipboard examples are the manual check. CI runs the suite with the Ubuntu 22.04 and 24.04 system Pythons and a current Python, so parser differences across interpreter releases are exercised.
+Clipboard tests simulate both desktop backends to verify bytes and MIME handling. They cannot prove that a particular desktop application accepts a paste; use the [desktop checks](EXAMPLES.md#desktop-checks) to verify your own session. CI runs the suite with the Ubuntu 22.04 and 24.04 system Pythons and a current Python, so parser differences across interpreter releases are exercised.
+
+Source review and maintainer ZIP updates: [MAINTAINING.md](MAINTAINING.md).
+
+## License
+
+[MIT](LICENSE), copyright Jim Lewis.

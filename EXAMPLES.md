@@ -158,3 +158,71 @@ The same capture command saves an image: copy a screenshot in an image-capable a
 ## Find what you saved
 
 `register show` lists all names and properties. With optional Bash completion installed, type `register get demo-` and press Tab; `register run demo-` offers only executable entries. New names appear immediately without reinstalling or editing completion.
+
+## Desktop checks
+
+These three checks cover the installed command, live completion, and real application pastes. From the project folder, run `./install.sh --dependencies`, then open a **new Bash terminal**. Keep that same terminal for all three checks. Use a blank LibreOffice Writer document, or another application that accepts both text and image pastes. The checks replace the desktop clipboard.
+
+Start a separate temporary store:
+
+```bash
+export REGISTER_HOME="$(mktemp -d)"
+printf 'Test store: %s\n' "$REGISTER_HOME"
+register add check-text 'register text: café 42'
+register add check-command 'printf "register command works\n"' --exec
+```
+
+### 1. Complete names as they change
+
+Type `register get check-` and press Tab twice. It should offer `check-text` and `check-command`. Press Ctrl+U to clear the unfinished command, then run:
+
+```bash
+register add check-later 'added after the first completion'
+```
+
+Type `register get check-` and press Tab twice again: `check-later` must now appear too. Clear the line with Ctrl+U. Type `register run check-` and press Tab: it should complete only `check-command`. Press Enter; expect `register command works`.
+
+### 2. Paste and recapture exact text
+
+Copy and run this whole block. It publishes the text and verifies recapture before you need to copy another command, which would replace the clipboard.
+
+```bash
+(
+    set -e
+    register get check-text CLIPBOARD
+    register add check-text-back CLIPBOARD
+    cmp <(register get check-text) <(register get check-text-back)
+    printf 'Text bytes match. Paste into the document now.\n'
+)
+```
+
+Expect `Text bytes match`. Switch to the document and press Ctrl+V: expect exactly `register text: café 42`.
+
+### 3. Save and restore an actual image clipboard
+
+Copy and run this whole block **first**. At its first prompt, copy a screenshot to the clipboard, or right-click a browser image and choose **Copy image**. Return to the terminal and press Enter. At its second prompt, paste into the document to confirm you get the test text, then return and press Enter again.
+
+```bash
+(
+    set -e
+    read -r -p 'Copy an image now, then return and press Enter: '
+    register add check-image CLIPBOARD
+    register show check-image
+    register get check-text CLIPBOARD
+    read -r -p 'Paste into the document: expect text. Return and press Enter: '
+    register get check-image CLIPBOARD
+    register add check-image-back CLIPBOARD
+    cmp <(register get check-image) <(register get check-image-back)
+    printf 'Image bytes match. Paste into the document: expect the original image.\n'
+)
+```
+
+The displayed metadata should have a `mime` beginning with `image/` and a `size` greater than zero. After `Image bytes match`, switch to the document and press Ctrl+V: the original image should appear. This checks that the image came back from its register after the clipboard had been replaced.
+
+When finished, return to your normal registers:
+
+```bash
+unset REGISTER_HOME
+```
+
+The temporary store remains at the path printed earlier. Repeat the checks on each desktop you use. If a check fails, keep the command output and the receiving application's name.

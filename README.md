@@ -2,17 +2,34 @@
 
 Persistent named buffers for Linux. Save text, file contents, images, or commands; retrieve exact bytes, send them to the clipboard, or execute a saved command.
 
-Buffers survive new terminals and reboots. Keep a useful input, the command that transforms it, and the result under separate names. JSON arrays, NUL-separated filenames, and PDFs are all ordinary byte buffers; their consuming programs decide how to interpret them.
+[Examples](EXAMPLES.md) · [Design decisions](DESIGN.md) · [Tests](#storage-and-tests) · [MIT license](LICENSE)
+
+Buffers survive new terminals and reboots. Keep an input, the command that transforms it, and the result under separate names. JSON arrays, NUL-separated filenames, and PDFs use the same small interface.
+
+![Terminal demo: save a service list, save a sorting command, and capture the unique names.](docs/demo.gif)
+
+## A buffer for each step
+
+Suppose several checks report the same services. Save the list, keep a reusable command to deduplicate it, and capture the result:
 
 ```bash
-register add greeting 'hello world'
-register get greeting | tr a-z A-Z | register update greeting
-register add greet 'printf "Hello, %s\n" "$1"' --exec
-register run greet world
-register show
+printf '%s\n' api worker api web | register add demo-services
+register add demo-unique 'sort -u' --exec
+register get demo-services |
+    register run demo-unique |
+    register add demo-rollout
+register get demo-rollout
 ```
 
-The pipeline changes `greeting` to `HELLO WORLD`; `register get greeting` retrieves it exactly, without an added newline. Running `greet` prints `Hello, world`.
+```text
+api
+web
+worker
+```
+
+The input, command, and result remain available independently. `get` retrieves bytes; `run` executes a command explicitly. Pipe a new list into `register update demo-services` to replace the input, then rerun the pipeline with `update demo-rollout` to refresh the result. `register show` lists what you have saved.
+
+The animation shows output captured from these commands. After [installation](#install), paste the block once; `add` refuses to overwrite existing names. The longer [examples](EXAMPLES.md) use an isolated store and cover JSON filters, Bash arrays, files, and images.
 
 ## Install
 
@@ -123,7 +140,11 @@ The tests invoke the real CLI in temporary stores and check returned bytes, prop
 
 Clipboard tests simulate both desktop backends to verify bytes and MIME handling. They cannot prove that a particular desktop application accepts a paste; use the [desktop checks](EXAMPLES.md#desktop-checks) to verify your own session. CI runs the suite with the Ubuntu 22.04 and 24.04 system Pythons and a current Python, so parser differences across interpreter releases are exercised.
 
-Source review and maintainer ZIP updates: [MAINTAINING.md](MAINTAINING.md).
+Read [DESIGN.md](DESIGN.md) for the storage model, execution boundary, tradeoffs, and tests behind them. Source review and maintainer ZIP updates are documented separately in [MAINTAINING.md](MAINTAINING.md).
+
+## Contributing
+
+For a bug report, include the command, expected and actual behavior, Python version, and a small input that reproduces it. For a code change, run the suite above and include a regression test for any behavior you fix. Propose new commands before implementing them; a small, predictable interface is the goal.
 
 ## License
 

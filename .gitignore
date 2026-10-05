@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 .venv/
+/register-snapshot.zip
+/register_update.zip

@@ -148,18 +148,15 @@ def _choose_type(types, *, x11=False):
     raise SupportError("the clipboard has no supported contents")
 
 
-def read_clipboard(selection):
-    """Return exact selected clipboard bytes and their advertised MIME type."""
-    if selection not in ("clipboard", "primary"):
-        raise SupportError("unknown clipboard selection")
+def read_clipboard():
+    """Return exact clipboard bytes and their advertised MIME type."""
     if _backend() == "wayland":
-        primary = ["--primary"] if selection == "primary" else []
-        offered = _call(["wl-paste", "--list-types"] + primary)
+        offered = _call(["wl-paste", "--list-types"])
         types = offered.decode("utf-8", "replace").splitlines()
         target, mime = _choose_type(types)
-        data = _call(["wl-paste", "--no-newline", "--type", target] + primary)
+        data = _call(["wl-paste", "--no-newline", "--type", target])
     else:
-        base = ["xclip", "-selection", selection, "-out", "-target"]
+        base = ["xclip", "-selection", "clipboard", "-out", "-target"]
         offered = _call(base + ["TARGETS"])
         types = offered.decode("utf-8", "replace").splitlines()
         target, mime = _choose_type(types, x11=True)
@@ -167,19 +164,15 @@ def read_clipboard(selection):
     return data, mime
 
 
-def write_clipboard(selection, data, mime):
+def write_clipboard(data, mime):
     """Publish a buffer using its stored MIME type, including image formats."""
-    if selection not in ("clipboard", "primary"):
-        raise SupportError("unknown clipboard selection")
     if not _valid_mime(mime):
         raise SupportError("invalid clipboard content type")
     if _backend() == "wayland":
         command = ["wl-copy", "--type", mime]
-        if selection == "primary":
-            command.append("--primary")
     else:
         target = "UTF8_STRING" if mime.lower() in (
             "text/plain;charset=utf-8", "text/plain;charset=utf8",
         ) else mime
-        command = ["xclip", "-selection", selection, "-in", "-target", target]
+        command = ["xclip", "-selection", "clipboard", "-in", "-target", target]
     _publish(command, data)

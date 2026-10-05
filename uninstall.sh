@@ -22,10 +22,15 @@ done
 
 if [[ -f "$HOME/.bashrc" ]]; then
     python3 - "$HOME/.bashrc" <<'PY'
-import pathlib
+import os
+from pathlib import Path
+import stat
 import sys
+import tempfile
 
-path = pathlib.Path(sys.argv[1])
+path = Path(sys.argv[1])
+if path.is_symlink():
+    path = path.resolve(strict=True)
 text = path.read_bytes()
 start_marker = b"# >>> register installer >>>\n"
 end_marker = b"# <<< register installer <<<\n"
@@ -33,10 +38,31 @@ start = text.find(start_marker)
 if start != -1:
     end = text.find(end_marker, start + len(start_marker))
     if end != -1:
-        text = text[:start] + text[end + len(end_marker):]
-        path.write_bytes(text)
+        block = text[start:end + len(end_marker)]
+        # Older installs combined PATH and completion. Retain their shared PATH
+        # setup so removing Register does not hide other user-installed tools.
+        shared = b'''# >>> user local bin >>>
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+# <<< user local bin <<<
+'''
+        preserve_path = b'case ":$PATH:" in' in block and b"$HOME/.local/bin" in block
+        replacement = shared if preserve_path and b"# >>> user local bin >>>\n" not in text else b""
+        text = text[:start] + replacement + text[end + len(end_marker):]
+        descriptor, temporary = tempfile.mkstemp(prefix=".bashrc-register-", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                os.fchmod(stream.fileno(), stat.S_IMODE(path.stat().st_mode))
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
         print(f"Removed the marked register block from {path}")
 PY
 fi
-printf '%s\n' 'Uninstalled. The project and saved registers are unchanged.' \
-    'In the current Bash shell, run: complete -r register 2>/dev/null; hash -r'
+printf '%s\n' 'Uninstalled. The project, saved registers, and shared user PATH are unchanged.' \
+    'In the current Bash shell, run: complete -r register 2>/dev/null; unset -f _register_completion; hash -r'

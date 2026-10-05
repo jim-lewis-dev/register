@@ -7,6 +7,7 @@ commands, MIME choices, and byte preservation without needing a live desktop.
 import base64
 import json
 import os
+import pty
 from pathlib import Path
 import shutil
 import signal
@@ -55,6 +56,20 @@ class CLIBase(unittest.TestCase):
     def metadata(self, name):
         return json.loads(self.cli("show", name).stdout)
 
+    def cli_tty(self, *args):
+        """Keep stdin genuinely interactive while still capturing diagnostics."""
+        master, slave = pty.openpty()
+        try:
+            result = subprocess.run(
+                COMMAND + list(args), stdin=slave, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=self.env, cwd=self.root, timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+            return result
+        finally:
+            os.close(slave)
+            os.close(master)
+
 
 class RegisterCLI(CLIBase):
     def test_exact_text_retrieval_and_quiet_mutation(self):
@@ -76,18 +91,214 @@ class RegisterCLI(CLIBase):
         self.cli("add", "empty", data=b"")
         self.assertEqual(self.cli("get", "empty").stdout, b"")
 
-    def test_explicit_stdin_source(self):
-        self.cli("add", "note", "--source", "-", data=b"one")
-        self.cli("update", "note", "--source", "-", data=b"two")
+    def test_dash_is_an_ordinary_object_and_omitted_object_reads_stdin(self):
+        self.cli("add", "dash_text", "-", data=b"ignored stdin")
+        self.assertEqual(self.cli("get", "dash_text").stdout, b"-")
+        (self.root / "-").write_bytes(b"dash file contents")
+        self.cli("add", "dash_file", "-", data=b"ignored stdin")
+        self.assertEqual(self.cli("get", "dash_file").stdout, b"dash file contents")
+        self.cli("add", "note", data=b"one")
+        self.cli("update", "note", data=b"two")
         self.assertEqual(self.cli("get", "note").stdout, b"two")
 
     def test_source_file_is_copied_not_linked(self):
         source = self.root / "filename with spaces.json"
         source.write_bytes(b'{"answer":42}\n')
-        self.cli("add", "config", "--source", str(source))
+        self.cli("add", "config", str(source))
         source.write_bytes(b"changed")
         source.unlink()
         self.assertEqual(self.cli("get", "config").stdout, b'{"answer":42}\n')
+
+    def test_literal_objects_are_quiet_and_have_no_added_newline(self):
+        for index, text in enumerate(("hello", "hello world", "report.pdf",
+                                      "./missing/report", "", "PRIMARY")):
+            with self.subTest(text=text):
+                name = "literal_%d" % index
+                result = self.cli("add", name, text)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(self.cli("get", name).stdout, text.encode())
+                self.assertFalse(self.metadata(name)["exec"])
+        self.cli("add", "PRIMARY", "ordinary name")
+        self.assertEqual(self.cli("get", "PRIMARY").stdout, b"ordinary name")
+
+    def test_long_literal_text_and_inline_command_do_not_fail_as_paths(self):
+        text = "hello " * 80
+        self.cli("add", "long_text", text)
+        self.assertEqual(self.cli("get", "long_text").stdout, text.encode())
+        script = "# " + "comment " * 80 + "\nprintf long-command"
+        self.cli("add", "long_command", "--exec", script)
+        self.assertEqual(self.cli("get", "long_command").stdout, script.encode())
+        self.assertEqual(self.cli("run", "long_command").stdout, b"long-command")
+
+    def test_object_with_existing_file_as_path_prefix_becomes_literal(self):
+        parent_file = self.root / "ordinary-file"
+        parent_file.write_bytes(b"unrelated bytes")
+        text = str(parent_file / "not-a-child")
+        result = self.cli("add", "path_text", text)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(self.cli("get", "path_text").stdout, text.encode())
+
+    def test_existing_file_wins_and_piped_filename_remains_literal(self):
+        source = self.root / "report.pdf"
+        content = b"%PDF-1.4\nfile contents\n"
+        source.write_bytes(content)
+        self.cli("add", "document", source.name)
+        self.assertEqual(self.cli("get", "document").stdout, content)
+        self.cli("add", "literal", data=source.name.encode())
+        self.assertEqual(self.cli("get", "literal").stdout, b"report.pdf")
+
+    def test_explicit_object_wins_over_stdin_on_add_and_update(self):
+        self.cli("add", "note", "explicit text", data=b"ignored input")
+        self.assertEqual(self.cli("get", "note").stdout, b"explicit text")
+        source = self.root / "input.txt"
+        source.write_bytes(b"file bytes")
+        self.cli("update", "note", str(source), data=b"ignored input")
+        self.assertEqual(self.cli("get", "note").stdout, b"file bytes")
+        self.cli("update", "note", "", data=b"ignored input")
+        self.assertEqual(self.cli("get", "note").stdout, b"")
+
+    def test_add_infers_executable_file_permission_and_honors_overrides(self):
+        executable = self.root / "script"
+        executable.write_bytes(b"printf inferred")
+        executable.chmod(0o751)
+        self.cli("add", "inferred", str(executable))
+        self.assertTrue(self.metadata("inferred")["exec"])
+        self.assertEqual(self.cli("run", "inferred").stdout, b"inferred")
+        self.cli("add", "disabled", str(executable), "--no-exec")
+        self.assertFalse(self.metadata("disabled")["exec"])
+        executable.chmod(0o640)
+        self.cli("add", "ordinary", str(executable))
+        self.assertFalse(self.metadata("ordinary")["exec"])
+        self.cli("add", "forced", str(executable), "--exec")
+        self.assertTrue(self.metadata("forced")["exec"])
+        self.assertEqual(self.cli("run", "forced").stdout, b"inferred")
+
+    def test_update_preserves_execution_permission_instead_of_reinferring(self):
+        executable = self.root / "script"
+        executable.write_bytes(b"printf updated")
+        executable.chmod(0o755)
+        self.cli("add", "disabled", "old text")
+        self.cli("update", "disabled", str(executable))
+        self.assertFalse(self.metadata("disabled")["exec"])
+        executable.chmod(0o644)
+        self.cli("add", "enabled", "old text", "--exec")
+        self.cli("update", "enabled", str(executable))
+        self.assertTrue(self.metadata("enabled")["exec"])
+        self.cli("update", "enabled", "replacement text")
+        self.assertTrue(self.metadata("enabled")["exec"])
+
+    def test_update_reads_redirected_stdin_and_empty_redirection_clears(self):
+        self.cli("add", "note", "old")
+        source = self.root / "replacement.txt"
+        source.write_bytes(b"redirected bytes\n")
+        for path, expected in ((source, b"redirected bytes\n"), (Path(os.devnull), b"")):
+            with path.open("rb") as incoming:
+                result = subprocess.run(
+                    COMMAND + ["update", "note"], stdin=incoming,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env=self.env, cwd=self.root, timeout=15,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(self.cli("get", "note").stdout, expected)
+
+    def test_multiple_objects_are_rejected_instead_of_joined(self):
+        self.cli("add", "note", "two", "words", code=None)
+        self.cli("get", "note", code=None)
+
+    def test_flags_work_before_or_after_object_and_delimiter_preserves_literal(self):
+        self.cli("add", "before", "--exec", "printf before")
+        self.cli("add", "after", "printf after", "--exec")
+        self.assertEqual(self.cli("run", "before").stdout, b"before")
+        self.assertEqual(self.cli("run", "after").stdout, b"after")
+        self.cli("update", "before", "--no-exec", "changed")
+        self.assertFalse(self.metadata("before")["exec"])
+        self.assertEqual(self.cli("get", "before").stdout, b"changed")
+        self.cli("add", "option-looking", "--", "--exec")
+        self.assertEqual(self.cli("get", "option-looking").stdout, b"--exec")
+        self.assertFalse(self.metadata("option-looking")["exec"])
+
+    def test_property_flags_can_precede_names_or_separate_positionals(self):
+        placements = (
+            ["--exec", "--mime", "text/x-shellscript", "NAME", "printf ready"],
+            ["NAME", "--mime", "text/x-shellscript", "printf ready", "--exec"],
+            ["NAME", "printf ready", "--exec", "--mime", "text/x-shellscript"],
+        )
+        for index, arguments in enumerate(placements):
+            name = "layout_%d" % index
+            arguments = [name if value == "NAME" else value for value in arguments]
+            with self.subTest(arguments=arguments):
+                self.cli("add", *arguments)
+                self.assertEqual(self.cli("run", name).stdout, b"ready")
+                self.assertEqual(self.metadata(name)["mime"], "text/x-shellscript")
+                self.cli("update", *["--no-exec" if value == "--exec" else value
+                                       for value in arguments])
+                self.assertFalse(self.metadata(name)["exec"])
+        for index, arguments in enumerate((
+                ["--exec", "layout_0", "TARGET"],
+                ["layout_0", "--exec", "TARGET"],
+                ["layout_0", "TARGET", "--exec"])):
+            name = "copy_%d" % index
+            self.cli("copy", *[name if value == "TARGET" else value for value in arguments])
+            self.assertEqual(self.cli("run", name).stdout, b"ready")
+
+    def test_delimiter_preserves_option_looking_objects_on_add_and_update(self):
+        for index, content in enumerate(("--exec", "--help", "--", "-value", "--mime=text/plain")):
+            name = "literal_option_%d" % index
+            with self.subTest(content=content):
+                self.cli("add", "--binary", name, "--exec", "--", content)
+                self.assertEqual(self.cli("get", name).stdout, content.encode())
+                self.assertTrue(self.metadata(name)["exec"])
+                self.assertFalse(self.metadata(name)["utf8"])
+                self.cli("update", name, "--no-exec", "--", content)
+                self.assertEqual(self.cli("get", name).stdout, content.encode())
+                self.assertFalse(self.metadata(name)["exec"])
+                self.cli("update", "--", name, content)
+                self.assertEqual(self.cli("get", name).stdout, content.encode())
+
+    def test_invalid_options_do_not_create_or_change_registers(self):
+        for arguments in (("add", "note", "--ex", "printf nope"),
+                          ("add",), ("add", "--exec", "--"),
+                          ("add", "note", "--unknown"),
+                          ("add", "note", "--exec", "--no-exec", "text"),
+                          ("add", "note", "--mime")):
+            with self.subTest(arguments=arguments):
+                self.cli(*arguments, code=2)
+                self.assertFalse(self.store.exists())
+        self.cli("add", "note", "original")
+        self.cli("update", "note", "--exec", "two", "objects", code=2)
+        self.assertEqual(self.cli("get", "note").stdout, b"original")
+        self.assertFalse(self.metadata("note")["exec"])
+
+    def test_help_works_for_root_and_each_command_without_creating_store(self):
+        for arguments in (("--help",), *((command, "--help") for command in (
+                "add", "update", "copy", "remove", "show", "get", "run"))):
+            with self.subTest(arguments=arguments):
+                self.assertIn(b"usage:", self.cli(*arguments).stdout)
+                self.assertFalse(self.store.exists())
+
+    def test_regular_file_symlink_uses_target_contents_and_permissions(self):
+        target = self.root / "target"
+        target.write_bytes(b"printf linked")
+        target.chmod(0o644)
+        link = self.root / "link"
+        link.symlink_to(target)
+        self.cli("add", "linked", str(link))
+        self.assertEqual(self.cli("get", "linked").stdout, b"printf linked")
+        self.assertFalse(self.metadata("linked")["exec"])
+        target.chmod(0o755)
+        self.cli("add", "runnable", str(link))
+        self.assertTrue(self.metadata("runnable")["exec"])
+        self.assertEqual(self.cli("run", "runnable").stdout, b"linked")
+
+    def test_get_rejects_arbitrary_destinations_and_primary(self):
+        self.cli("add", "note", "precious")
+        destination = self.root / "output.txt"
+        for target in (str(destination), "PRIMARY", "-"):
+            with self.subTest(target=target):
+                self.cli("get", "note", target, code=None)
+        self.assertFalse(destination.exists())
+        self.assertEqual(self.cli("get", "note").stdout, b"precious")
 
     def test_binary_get_preserves_every_byte(self):
         content = bytes(range(256)) * 8
@@ -99,7 +310,7 @@ class RegisterCLI(CLIBase):
         source = self.root / "report.pdf"
         content = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n"
         source.write_bytes(content)
-        self.cli("add", "report", "--source", str(source))
+        self.cli("add", "report", str(source))
         meta = self.metadata("report")
         self.assertFalse(meta["utf8"])
         self.assertEqual(meta["mime"], "application/pdf")
@@ -112,7 +323,7 @@ class RegisterCLI(CLIBase):
         self.assertEqual(meta["mime"], "image/png")
         self.assertEqual(self.cli("get", "picture").stdout, PNG)
 
-    def test_text_flag_is_advisory_and_bytes_unchanged(self):
+    def test_utf8_override_is_advisory_and_bytes_unchanged(self):
         self.cli("add", "blob", "--utf8", data=b"\xff\x00")
         self.assertTrue(self.metadata("blob")["utf8"])
         self.assertEqual(self.cli("get", "blob").stdout, b"\xff\x00")
@@ -133,23 +344,47 @@ class RegisterCLI(CLIBase):
         self.assertEqual(self.cli("get", "payload").stdout, b"payload")
         for invalid in ("text/plain\nx-injected", "text /plain", "plain"):
             with self.subTest(mime=invalid):
-                self.cli("update", "payload", "--keep-content", "--mime", invalid, code=None)
+                self.cli("update", "payload", "--mime", invalid, code=None)
         self.assertEqual(self.metadata("payload")["mime"], "application/example")
 
-    def test_keep_content_changes_properties_without_reading_input(self):
+    def test_terminal_flag_updates_preserve_contents_and_unspecified_properties(self):
         content = b'printf "%s\\n" kept\n'
-        self.cli("add", "task", "--exec", data=content)
-        self.cli("update", "task", "--no-exec", "--keep-content", data=b"")
+        self.cli("add", "task", "--exec", "--mime", "application/example", data=content)
+        before = self.metadata("task")
+        self.cli_tty("update", "task", "--no-exec")
         self.assertEqual(self.cli("get", "task").stdout, content)
-        self.assertFalse(self.metadata("task")["exec"])
-        self.cli("update", "task", "--binary", "--keep-content", data=b"ignored")
+        self.assertEqual(self.metadata("task"), {**before, "exec": False})
+        self.cli_tty("update", "task", "--binary")
         self.assertEqual(self.cli("get", "task").stdout, content)
-        self.assertFalse(self.metadata("task")["utf8"])
+        self.assertEqual(self.metadata("task"), {**before, "exec": False, "utf8": False})
 
-    def test_keep_content_cannot_be_combined_with_source(self):
+    def test_terminal_add_is_empty_and_terminal_update_preserves_all_properties(self):
+        self.cli_tty("add", "blank")
+        self.assertEqual(self.cli("get", "blank").stdout, b"")
+        content = b"unchanged"
+        self.cli("add", "note", "--exec", "--binary", "--mime", "application/example", data=content)
+        before = self.metadata("note")
+        self.cli_tty("update", "note")
+        self.assertEqual(self.cli("get", "note").stdout, content)
+        self.assertEqual(self.metadata("note"), before)
+
+    def test_empty_stdin_with_flags_still_replaces_content(self):
+        self.cli("add", "note", "--exec", data=b"old contents")
+        self.cli("update", "note", "--no-exec", data=b"")
+        self.assertEqual(self.cli("get", "note").stdout, b"")
+        self.assertFalse(self.metadata("note")["exec"])
+
+    def test_removed_input_options_fail_without_mutating_content(self):
         self.cli("add", "note", data=b"unchanged")
-        self.cli("update", "note", "--keep-content", "--source", "-", code=None)
-        self.assertEqual(self.cli("get", "note").stdout, b"unchanged")
+        for option, value in (("--source", "-"), ("--keep-content", None),
+                              ("--text", "literal")):
+            with self.subTest(option=option):
+                args = ["update", "note", option]
+                if value is not None:
+                    args.append(value)
+                self.cli(*args, data=b"replacement", code=None)
+                self.assertEqual(self.cli("get", "note").stdout, b"unchanged")
+        self.cli("get", "note", "--to", "CLIPBOARD", code=None)
 
     def test_add_refuses_existing_name_and_preserves_properties(self):
         self.cli("add", "note", "--exec", data=b"old")
@@ -198,7 +433,7 @@ class RegisterCLI(CLIBase):
         self.assertEqual(self.cli("get", "note").stdout, b"new")
 
     def test_reserved_endpoints_and_paths_are_rejected(self):
-        for name in ("CLIPBOARD", "PRIMARY", ".", "..", "../escape", "a/b", ""):
+        for name in ("CLIPBOARD", ".", "..", "../escape", "a/b", ""):
             with self.subTest(name=name):
                 self.cli("add", name, data=b"data", code=None)
         self.assertEqual(json.loads(self.cli("show").stdout), [])
@@ -210,13 +445,13 @@ class RegisterCLI(CLIBase):
                 self.cli("add", name, data=name.encode())
                 self.assertEqual(self.cli("get", name).stdout, name.encode())
 
-    def test_run_requires_explicit_execution_permission(self):
+    def test_text_command_requires_execution_permission(self):
         self.cli("add", "task", data=b"printf ran")
         result = self.cli("run", "task", code=None)
         self.assertEqual(result.stdout, b"")
-        self.cli("update", "task", "--exec", "--keep-content")
+        self.cli_tty("update", "task", "--exec")
         self.assertEqual(self.cli("run", "task").stdout, b"ran")
-        self.cli("update", "task", "--no-exec", "--keep-content")
+        self.cli_tty("update", "task", "--no-exec")
         self.cli("run", "task", code=None)
 
     def test_no_shebang_uses_bash_even_if_shell_is_elsewhere(self):
@@ -237,6 +472,15 @@ class RegisterCLI(CLIBase):
         self.cli("add", "task", "--exec", data=script)
         result = self.cli("run", "task", "two words", "--literal", "", cwd=caller)
         self.assertEqual(result.stdout, (str(caller) + "\ntwo words\n--literal\n\n").encode())
+
+    def test_run_passes_help_options_and_double_dash_to_child_unchanged(self):
+        self.cli("add", "arguments", 'printf "%s\\0" "$@"', "--exec")
+        for arguments in (("--help",), ("--", "--help"),
+                          ("--exec", "two words", "", "--", "--mime=text/plain")):
+            with self.subTest(arguments=arguments):
+                expected = b"".join(value.encode() + b"\0" for value in arguments)
+                self.assertEqual(self.cli("run", "arguments", *arguments).stdout, expected)
+                self.assertEqual(self.cli("run", "--", "arguments", *arguments).stdout, expected)
 
     def test_run_accepts_piped_input_and_output_can_be_captured(self):
         self.cli("add", "clean", "--exec", data=b"sed '/^[[:space:]]*$/d' | sort -u\n")
@@ -268,16 +512,25 @@ class RegisterCLI(CLIBase):
         binary = shutil.which("printf")
         if not binary:
             self.skipTest("native printf executable unavailable")
-        self.cli("add", "native", "--exec", "--source", binary)
+        self.cli("add", "native", "--exec", binary)
         self.assertEqual(self.cli("run", "native", "%s", "hello").stdout, b"hello")
 
-    def test_missing_update_source_preserves_bytes_and_properties(self):
+    def test_invalid_file_sources_preserve_bytes_and_properties(self):
+        directory = self.root / "directory"
+        directory.mkdir()
+        broken = self.root / "broken-link"
+        broken.symlink_to(self.root / "absent-target")
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
         self.cli("add", "note", "--exec", data=b"original")
         before = self.metadata("note")
-        self.cli("update", "note", "--no-exec", "--binary", "--source",
-                 str(self.root / "missing"), code=None)
-        self.assertEqual(self.cli("get", "note").stdout, b"original")
-        self.assertEqual(self.metadata("note"), before)
+        for source in (directory, broken, fifo):
+            with self.subTest(source=source):
+                result = self.cli("update", "note", "--no-exec", "--binary", str(source), code=1)
+                reason = b"broken symlink" if source == broken else b"regular file"
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(self.cli("get", "note").stdout, b"original")
+                self.assertEqual(self.metadata("note"), before)
 
     def test_database_lock_failure_preserves_previous_complete_value(self):
         self.cli("add", "note", "--exec", data=b"original")
@@ -402,10 +655,11 @@ if os.environ.get("FAKE_DESKTOP_FAIL"):
 def option(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 
-selection = option("-selection", "clipboard") if name == "xclip" else (
-    "primary" if "--primary" in args else "clipboard")
-meta_path = root / (selection + ".json")
-data_path = root / (selection + ".bin")
+if "--primary" in args or (name == "xclip" and option("-selection") != "clipboard"):
+    print("unexpected selection", file=sys.stderr)
+    sys.exit(6)
+meta_path = root / "clipboard.json"
+data_path = root / "clipboard.bin"
 meta = json.loads(meta_path.read_text()) if meta_path.exists() else {"types": []}
 if name == "wl-paste" or (name == "xclip" and "-out" in args):
     requested = option("-target") if name == "xclip" else option("--type")
@@ -461,13 +715,13 @@ class ClipboardCLI(CLIBase):
             env["DISPLAY"] = ":99"
         return env
 
-    def seed(self, content, types, selection="clipboard"):
-        (self.desktop / (selection + ".bin")).write_bytes(content)
-        (self.desktop / (selection + ".json")).write_text(json.dumps({"types": types}))
+    def seed(self, content, types):
+        (self.desktop / "clipboard.bin").write_bytes(content)
+        (self.desktop / "clipboard.json").write_text(json.dumps({"types": types}))
 
-    def written(self, selection="clipboard"):
-        meta = json.loads((self.desktop / (selection + ".json")).read_text())
-        return (self.desktop / (selection + ".bin")).read_bytes(), meta["written_type"]
+    def written(self):
+        meta = json.loads((self.desktop / "clipboard.json").read_text())
+        return (self.desktop / "clipboard.bin").read_bytes(), meta["written_type"]
 
     def test_identical_clipboard_api_preserves_text_on_each_desktop(self):
         content = "café\nno added newline".encode()
@@ -477,10 +731,10 @@ class ClipboardCLI(CLIBase):
                 types = ["UTF8_STRING", "text/plain"] if kind == "x11" else ["text/plain;charset=utf-8"]
                 self.seed(content, types)
                 name = kind + "_note"
-                self.cli("add", name, "--source", "CLIPBOARD", env=env)
+                self.cli("add", name, "CLIPBOARD", env=env)
                 self.assertEqual(self.cli("get", name).stdout, content)
                 self.seed(b"different", types)
-                self.cli("get", name, "--to", "CLIPBOARD", env=env)
+                self.cli("get", name, "CLIPBOARD", env=env)
                 self.assertEqual(self.written()[0], content)
 
     def test_image_clipboard_round_trip_preserves_mime_and_bytes(self):
@@ -491,24 +745,24 @@ class ClipboardCLI(CLIBase):
                 types = ["text/plain", "image/png"]
                 self.seed(PNG, types)
                 name = kind + "_image"
-                self.cli("add", name, "--source", "CLIPBOARD", env=env)
+                self.cli("add", name, "CLIPBOARD", env=env)
                 self.assertEqual(self.metadata(name)["mime"], "image/png")
                 self.assertEqual(self.cli("get", name).stdout, PNG)
                 self.seed(b"different", ["text/plain"])
-                self.cli("get", name, "--to", "CLIPBOARD", env=env)
+                self.cli("get", name, "CLIPBOARD", env=env)
                 self.assertEqual(self.written(), (PNG, "image/png"))
 
-    def test_primary_uses_same_interface(self):
+    def test_clipboard_token_wins_over_a_file_with_the_same_name(self):
+        (self.root / "CLIPBOARD").write_bytes(b"file contents")
         for kind in ("x11", "wayland"):
             with self.subTest(backend=kind):
                 env = self.backend(kind)
                 types = ["UTF8_STRING"] if kind == "x11" else ["text/plain"]
-                self.seed(b"selected", types, selection="primary")
-                name = kind + "_selection"
-                self.cli("add", name, "--source", "PRIMARY", env=env)
-                self.assertEqual(self.cli("get", name).stdout, b"selected")
-                self.cli("get", name, "--to", "PRIMARY", env=env)
-                self.assertEqual(self.written("primary")[0], b"selected")
+                self.seed(b"clipboard contents", types)
+                name = kind + "_reserved_input"
+                self.cli("add", name, "CLIPBOARD", env=env)
+                self.assertEqual(self.cli("get", name).stdout, b"clipboard contents")
+                self.assertEqual((self.root / "CLIPBOARD").read_bytes(), b"file contents")
 
     def test_empty_text_clipboard_is_valid_and_clears(self):
         for kind in ("x11", "wayland"):
@@ -518,16 +772,16 @@ class ClipboardCLI(CLIBase):
                 self.seed(b"", types)
                 name = kind + "_empty"
                 self.cli("add", name, data=b"old")
-                self.cli("update", name, "--source", "CLIPBOARD", env=env)
+                self.cli("update", name, "CLIPBOARD", env=env)
                 self.assertEqual(self.cli("get", name).stdout, b"")
-                self.cli("get", name, "--to", "CLIPBOARD", env=env)
+                self.cli("get", name, "CLIPBOARD", env=env)
                 self.assertEqual(self.written()[0], b"")
 
     def test_imported_image_can_be_sent_to_clipboard(self):
         self.cli("add", "picture", data=PNG)
         for kind in ("x11", "wayland"):
             with self.subTest(backend=kind):
-                self.cli("get", "picture", "--to", "CLIPBOARD", env=self.backend(kind))
+                self.cli("get", "picture", "CLIPBOARD", env=self.backend(kind))
                 self.assertEqual(self.written(), (PNG, "image/png"))
 
     def test_failed_clipboard_read_preserves_previous_register(self):
@@ -535,13 +789,13 @@ class ClipboardCLI(CLIBase):
         before = self.metadata("note")
         env = self.backend("wayland")
         env["FAKE_DESKTOP_FAIL"] = "1"
-        self.cli("update", "note", "--no-exec", "--source", "CLIPBOARD", env=env, code=None)
+        self.cli("update", "note", "--no-exec", "CLIPBOARD", env=env, code=None)
         self.assertEqual(self.cli("get", "note").stdout, b"original")
         self.assertEqual(self.metadata("note"), before)
 
     def test_wayland_is_preferred_with_both_desktop_environment_variables(self):
         self.seed(b"hello", ["text/plain"])
-        self.cli("add", "note", "--source", "CLIPBOARD", env=self.backend("wayland"))
+        self.cli("add", "note", "CLIPBOARD", env=self.backend("wayland"))
         commands = [json.loads(line) for line in (self.desktop / "commands.jsonl").read_text().splitlines()]
         self.assertTrue(commands)
         self.assertTrue(all(command[0] == "wl-paste" for command in commands), commands)
@@ -555,8 +809,8 @@ class ClipboardCLI(CLIBase):
         empty_path = self.root / "empty_path"
         empty_path.mkdir()
         env["PATH"] = str(empty_path)
-        self.cli("get", "note", "--to", "CLIPBOARD", env=env, code=None)
-        self.cli("get", "note", "--to", "CLIPBOARD", code=None)
+        self.cli("get", "note", "CLIPBOARD", env=env, code=None)
+        self.cli("get", "note", "CLIPBOARD", code=None)
         self.assertEqual(self.cli("get", "note").stdout, b"saved")
 
     def test_background_clipboard_owner_does_not_delay_command_completion(self):
@@ -565,7 +819,7 @@ class ClipboardCLI(CLIBase):
         env["FAKE_DESKTOP_BACKGROUND"] = "1"
         started = time.monotonic()
         try:
-            self.cli("get", "note", "--to", "CLIPBOARD", env=env)
+            self.cli("get", "note", "CLIPBOARD", env=env)
             self.assertLess(time.monotonic() - started, 3)
             self.assertEqual(self.written()[0], b"saved")
         finally:
